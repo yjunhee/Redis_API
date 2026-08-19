@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>선착순 쿠폰 발급 테스트</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f4f7f6;
+        }
+        .card {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            text-align: center;
+            width: 360px;
+        }
+        h2 { margin-top: 0; color: #333; }
+        .input-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        label { display: block; font-size: 14px; color: #666; margin-bottom: 5px; }
+        input {
+            width: 100%;
+            padding: 10px;
+            box-sizing: border-box;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 16px;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: #45a049; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        #result {
+            margin-top: 20px;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            display: none;
+            word-break: break-all;
+        }
+        .success { background-color: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
+        .error { background-color: #ffebee; color: #c62828; border: 1px solid #ffcdd2; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>선착순 쿠폰 발급</h2>
+    
+    <div class="input-group">
+        <label for="couponId">쿠폰 ID</label>
+        <input type="number" id="couponId" value="1">
+    </div>
+    
+    <div class="input-group">
+        <label for="userId">유저 ID</label>
+        <input type="number" id="userId" value="1">
+    </div>
+
+    <button id="issueBtn" onclick="issueCoupon()">쿠폰 발급받기</button>
+
+    <div id="result"></div>
+</div>
+
+<script>
+    async function issueCoupon() {
+        const couponId = document.getElementById('couponId').value;
+        const userId = document.getElementById('userId').value;
+        const btn = document.getElementById('issueBtn');
+        const resultDiv = document.getElementById('result');
+
+        if (!couponId || !userId) {
+            alert("쿠폰 ID와 유저 ID를 입력해 주세요.");
+            return;
+        }
+
+        btn.disabled = true;
+        btn.innerText = "발급 요청 중...";
+        resultDiv.style.display = "none";
+
+        try {
+            // POST 요청
+            const response = await fetch(`/coupons/${couponId}/issue/redis?userId=${userId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'}
+            });
+
+            const data = await response.text();
+
+            resultDiv.style.display = "block";
+            if (response.ok) {
+                resultDiv.className = "success";
+                resultDiv.innerHTML = `<strong> 발급 성공!</strong><br>${data}`;
+            } else {
+                resultDiv.className = "error";
+                resultDiv.innerHTML = `<strong> 발급 실패</strong><br>${data}`;
+            }
+        } catch (error) {
+            resultDiv.style.display = "block";
+            resultDiv.className = "error";
+            resultDiv.innerHTML = `<strong> 네트워크 오류</strong><br>서버 연결에 실패했습니다.`;
+        } finally {
+            btn.disabled = false;
+            btn.innerText = "쿠폰 발급받기";
+        }
+    }
+</script>
+
+</body>
+</html>

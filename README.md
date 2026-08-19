@@ -1,0 +1,229 @@
+#  1,000명 동시 접속 환경의 선착순 쿠폰 발급 API
+
+> RDBMS,  Redis 동시성 제어 비교
+> 
+> **1,000명의 동시 요청 환경에서 500장의 선착순 쿠폰을 정확하게 발급하고,
+> 동시성 제어 방식에 따른 성능과 정합성의 Trade-off를 비교 검증한다.**
+
+---
+
+## 개요
+
+선착순 이벤트는 단시간에 대규모 트래픽이 집중되어 **동시성 이슈(Race Condition)** 및 **데이터베이스 I/O 병목 현상**이 발생하는 대표적인 상황이다.
+
+본 프로젝트에서는 **RDBMS(MySQL) 기반의 동시성 제어** 방식과 **Redis 기반의 In-Memory 동시성 제어** 방식을 구현하고, 부하 테스트 도구인 **k6**를 활용해 성능(TPS, Latency) 및 정합성을 비교 검증한다.
+
+### 핵심 목표
+- **데이터 정합성 (Data Integrity)**: 1,000건 이상의 동시 요청 환경에서 초과 발급 없이 **정확히 500건만 발급** (Race Condition 차단)
+- **성능향상 및 시스템 안정성**: DB Lock 병목을 제거하여 **TPS 극대화 및 응답 속도(Latency) 최소화**.
+
+---
+
+## 기술 스택
+
+| 분류 | 기술 스택 |
+| :--- | :--- |
+| **Language / Framework** | Java 17, Spring Boot 3.3.5, Spring Data JPA |
+| **Database** | MySQL 8.0, Redis v4.2.3, Apache Kafka 4.3.1 |
+| **Load Test** | k6 v2.2.0 |
+
+---
+
+## 시스템 아키텍처
+
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/606b3a4d-bb09-4da0-86ea-f7da3ab961c6" />
+
+## K6 부하 테스트
+### 테스트 환경
+| 항목 | 환경 |
+|---|---|
+| OS | Windows 11 |
+| CPU | i3-9100F |
+| RAM | 16GB |
+| Redis | Memurai |
+| Kafka | 4.3.1 |
+| k6 | v2.2.0 |
+| Tomcat Max Threads | 1,000 | 
+
+### 테스트 시나리오
+> **Target Scenario**: 
+> - executor: shared-iterations
+> - iterations: 1000
+> - vus (Virtual Users): 1000
+
+#### **Target API**: `POST /coupons/1/issue?userId={userId}`, `POST /coupons/1/issue/redis?userId={userId}`
+#### **검증 기준**: HTTP 200 및 MySQL CouponIssue 테이블 체크
+---
+
+### RDBMS(No Lock) 테스트 결과
+<img width="724" height="421" alt="Image" src="https://github.com/user-attachments/assets/61c43217-2a70-489b-8274-1a3e8a2fd989" />
+
+| 지표 (Metrics) | 측정 결과 수치 | 비고 및 상태 |
+| :--- | :--- | :--- |
+| **Total Requests** | 1,000 req | 총 요청 건수 |
+| **Throughput (TPS)** | **243.19 req/s** | 초당 처리량 |
+| **HTTP 200** | **54.9% (549건)** | 쿠폰 발급 성공 |
+| **HTTP 400** | **45.1% (451건)** | 쿠폰 발급 실패 |
+| **p(95) Latency** | **3.89s(3,890ms)** | 상위 5% 요청의 응답 시간 |
+| **Max Latency** | **3.97s (3,970ms)** | 최대 응답 시간 |
+| **데이터 정합성 (Integrity)** | **49건 초과 발급** | Race Condition 발생  |
+
+---
+
+### 결과 분석
+
+> ####  Race Condition으로 인한 초과 발급
+> DB에서 `조회 → 검증 → 발급`과정을 처리하는데, 
+> 여러 요청이 동시에 현재 발급 수량을 읽고 발급 가능으로 판단하여 **Race Condition(49건의 초과 발급 발생)** 이 발생한다.
+
+> ####  동시성 환경에서의 성능 한계 
+> Lock을 사용하지 않았음에도 1,000개의 동시 요청으로 인한 
+> **DB Connection Pool 경합 및 I/O 병목**으로 TPS가 **243.19 req/s** 수준에 머물렀다.
+
+---
+
+### RDBMS(Pessimistic Lock) 테스트 결과
+<img width="732" height="415" alt="Image" src="https://github.com/user-attachments/assets/12a7a8c6-2646-416b-a4ec-2a0f1223a15e" />
+
+| 지표 (Metrics) | 측정 결과 수치 | 비고 및 상태 |
+| :--- | :--- | :--- |
+| **Total Requests** | 1,000 req | 총 요청 건수 |
+| **Throughput (TPS)** | **170.91 req/s** | 초당 처리량 |
+| **HTTP 200** | **50% (500건)** | 쿠폰 발급 성공 |
+| **HTTP 400** | **50% (500건)** | 쿠폰 발급 실패 |
+| **p(95) Latency** | **5.61s(5,610ms)** | 상위 5% 요청의 응답 시간 |
+| **Max Latency** | **5.72s (5,720ms)** | 최대 응답 시간 |
+| **데이터 정합성 (Integrity)** | **초과 발급 X** | 정합성 만족  |
+
+---
+
+### 결과 분석
+
+> #### 비관적 락(Pessimistic Lock)을 통한 정합성 확보
+> 쿠폰 레코드에 비관적 락(Pessimistic Lock)을 적용하여 트랜잭션을 순차 처리함으로써 
+> **정확히 500건**만 발급하여 정합성 문제를 해결했다.
+
+> #### Lock Queueing으로 인한 응답 지연
+> 동시 요청이 Lock 획득을 위해 대기(Queueing)하면서 
+> **No Lock 대비 TPS는 29.7% 감소(170.91 req/s)했고, p(95) Latency는 44.2% 증가(5.61s)** 하는 병목이 발생했다.
+
+---
+
+### Redis 테스트 결과
+<img width="703" height="417" alt="Image" src="https://github.com/user-attachments/assets/46569dee-715c-41b8-819b-2f516ad7dab0" />
+
+| 지표 (Metrics) | 측정 결과 수치 | 비고 및 상태 |
+| :--- | :--- | :--- |
+| **Total Requests** | 1,000 req | 총 요청 건수 |
+| **Throughput (TPS)** | **441.66 req/s** | 초당 처리량 |
+| **HTTP 200** | **50% (500건)** | 쿠폰 발급 성공 |
+| **HTTP 400** | **50% (500건)** | 쿠폰 발급 실패 |
+| **p(95) Latency** | **2.11s(2,110ms)** | 상위 5% 요청의 응답 시간 |
+| **Max Latency** | **2.12s (2,120ms)** | 최대 응답 시간 |
+| **데이터 정합성 (Integrity)** | **초과 발급 X** | 정합성 만족  |
+---
+
+### 결과 분석
+
+> #### 초기 Redis RTT로 인한 정합성 문제
+> 싱글 스레드 기반 Redis를 도입했으나, `조회 → 검증 → 발급` 명령 사이의 **네트워크 RTT(Round Trip Time)**사이 다른 요청들이 침범하면서 Race Condition이 발생하여 정합성이 깨지는 현상이 발생했다. 이를 해결하기 위해 중복 검증과 `조회 → 검증 → 발급` 과정을  
+> **Lua Script로 묶어 원자적(Atomic) 연산으로** 처리하게 함으로써 In-Memory 단에서 데이터 정합성을 확보했다.
+
+> #### DB Synchronous Write 병목으로 인한 응답 지연
+> Redis를 활용해 In-Memory 단에서 원자적(Atomic) 연산을 처리하더라도, HTTP 요청 주기 내에서 DB에 동기(Synchronous) 방식으로 데이터를 저장하면  **RDBMS I/O 병목 및 Connection Pool 고갈**로 인해 전체 응답 지연이 발생하였다. 이를 해결하기 위해 **Kafka 메시지 큐**를 도입하여 DB 쓰기 트랜잭션을 **비동기화**하였다.  Redis에서 검증 직후 Kafka로 이벤트를 발행하고, 클라이언트에게 즉시 응답(Early Return)하여 응답 속도를 최소화했으며, **Kafka Consumer를 통해 DB 저장을 HTTP 요청 처리 경로에서 분리하여 DB I/O 부하를 비동기 처리 영역으로 격리**하고 메시지 내구성(Durability)을 확보했다.
+
+> #### TPS 및 Latency 개선
+> DB에 직접 조회/수정 대신 Redis In-Memory 연산 및 Kafka 메시지 발행만 수행하여 응답 시간을 최소화하여, 
+> Pessimistic Lock 대비 처리량은 **170.91 req/s → 441.66req/s로  약158.39% 증가**했으며, p(95) Latency는 **5.61s → 2.11s로 약 62.4%감소**했다.
+
+## 최종 성능 비교 및 결론
+| 제어 방식 (Architecture) | TPS (초당 처리량) | p(95) Latency (응답 속도) | 데이터 정합성 (Integrity) |
+| :--- | :--- | :--- | :--- |
+| **RDBMS (No Lock)** | **243.19 req/s** | **3.89s(3,890ms)** | 실패(49건 초과발급) |
+| **RDBMS (Pessimistic Lock)** | **170.91 req/s -29.7%** | **5.61s(5,610ms) +44.2%** | 성공 |
+| **Redis + Kafka (In-Memory)** | **441.66 req/s +81.6%** | **2.11s(2,110ms) -45.8%** | 성공 |
+
+※ 모든 증감률은 No Lock 기준
+### No Lock 방식의 정합성 붕괴 및 Pessimistic Lock의 성능 한계
+동시성 제어가 없는 RDBMS(No Lock) 환경에서는 높은 TPS(243.19 req/s)를 기록했으나, Race Condition 발생으로 인해 500개 제한 대비 **49건이 초과 발급(실패)되며 데이터 정합성이 훼손**되었다. 이를 해결하기 위해 **비관적 락(Pessimistic Lock)**을 적용하여 500건 데이터 정합성을 확보했으나, **Lock Queueing으로 인해 No Lock 대비 TPS가 29.7% 감소(170.91 req/s)하고 p(95) 응답 시간은 44.2% 지연(5.61s)되는 성능 병목**을 확인했다.
+
+### Redis + Kafka 도입을 통한 병목 분리 및 성능 개선
+Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결합하여 500건 발급 제한을 초과하지 않고 정합성을 확보했다. 동시에 Kafka 비동기 파이프라인을 통해 HTTP 요청 주기의 DB I/O 부하를 HTTP 요청 처리 경로에서 분리함으로써, **No Lock 기준 대비 TPS는 81.6% 상승(441.66 req/s), p(95) 응답 시간은 45.8% 단축(2.11s)이라는 성능 개선**을 확인했다. (Pessimistic Lock 대비 TPS +158.4%, 응답 시간 -62.4%)
+
+### 아키텍처 인사이트
+결과적으로 선착순 이벤트 시스템에서는 RDBMS Lock에 의존하는 방식보다, **Redis 싱글 스레드 기반의 In-Memory 동시성 제어와 Kafka 이벤트 드라이븐 비동기 처리(Eventual Consistency)를 결합한 아키텍처**가 본 테스트 환경과 요구사항에 가장 높은 처리량과 낮은 p(95)Latency를 보였다. 다만 DB 영속화를 비동기화하면서 Eventual Consistency라는 Trade Off와 **Redis/Kafka 장애에 대한 복구 전략**이 필요함을 확인했다.
+
+---
+
+## 장애 대응 및 트러블슈팅
+
+### Redis 서버 장애 대응
+
+문제 상황
+> Redis 장애 발생 시 쿠폰 발급 로직 중단
+
+테스트
+> Redis 프로세스 강제 종료
+
+검증
+→ HTTP Error
+→ 초과 발급 여부
+→ Redis 복구 후 정상 처리
+
+결과
+> 실제 수치 이미지 
+
+---
+
+### Kafka Consumer 장애 및 Lag 누적
+
+문제 상황
+> Consumer 장애로 DB 저장 지연
+
+테스트
+> Consumer 중단 후 쿠폰 요청 발생
+
+검증
+→ Kafka Lag 증가
+→ MySQL 저장 지연
+→ Consumer 복구 후 Lag 감소
+→ 최종 발급 건수
+
+결과
+> 실제 수치 이미지
+
+---
+
+### MySQL 서버 장애 및 Eventual Consistency
+
+문제 상황
+> MySQL 장애로 인한 DB 저장 실패
+
+테스트
+> MySQL 강제 종료 상태에서 쿠폰 발급
+
+검증
+→ Redis 발급 성공
+→ Kafka 메시지 적재
+→ Consumer 처리 실패
+→ MySQL 복구
+→ 메시지 재처리
+→ 최종 정합성
+
+결과
+> 실제 수치 이미지
+
+---
+
+## Redis 점진적 부하 한계 테스트
+| Target Load | 실제 TPS (초당 처리량) | p(95) Latency (응답 속도) | 데이터 정합성 (Integrity) | CPU | Memory |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **100req/s** | **-** | **-** | **-** | - | - |
+| **500req/s** | **-** | **-** | **-** | - | - |
+| **1000req/s** | **-** | **-** | **-** | - | - |
+| **2000req/s** | **-** | **-** | **-** | - | - |
+| **5000req/s** | **-** | **-** | **-** | - | - |
+
+### 결과
+-
+
