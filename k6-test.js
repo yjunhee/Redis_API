@@ -7,7 +7,6 @@ export const options = {
       executor: 'shared-iterations',
       iterations: 1000,
       vus: 1000,
-
       maxDuration: '60s',
     },
   },
@@ -34,7 +33,6 @@ export default function () {
 
   check(response, {
     'status is 200': (r) => r.status === 200,
-    'status is 400': (r) => r.status === 400,
-    'status is 409': (r) => r.status === 409,
+    'status is 400': (r) => r.status === 400
   });
 }

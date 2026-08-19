@@ -2,17 +2,22 @@ spring boot
 > gradlew clean bootRun
 
 redis
->net start memurai
->net stop memurai
->memurai.exe
+> net start memurai
+> net stop memurai
+> memurai.exe
+> memurai-cli
 
-kafka
-> .\bin\windows\kafka-storage.bat random-cluster-id
-> .\bin\windows\kafka-storage.bat format -t <복사한_CLUSTER_ID> -c .\config\kraft\server.properties
-> .\bin\windows\kafka-server-start.bat .\config\kraft\server.properties
+kafka cd C:\kafka
+> .\bin\windows\kafka-storage.bat random-uuid
+> .\bin\windows\kafka-storage.bat format -t Jw6WnxuFRDuVGgpwwsGvKw -c .\config\server.properties
+> .\bin\windows\kafka-server-start.bat .\config\server.properties
 
 kafka topic 생성
 > .\bin\windows\kafka-topics.bat --create --topic test-topic --bootstrap-server localhost:9092
 > .\bin\windows\kafka-console-producer.bat --topic test-topic --bootstrap-server localhost:9092
 > .\bin\windows\kafka-console-consumer.bat --topic test-topic --from-beginning --bootstrap-server localhost:9092
 
+K6 test
+> k6 run k6-test.js
+
+memurai > kafka > spring boot

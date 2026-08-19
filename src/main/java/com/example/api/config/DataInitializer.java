@@ -5,37 +5,48 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import com.example.api.domain.Coupon;
+import com.example.api.repository.CouponIssueRepository;
 import com.example.api.repository.CouponRepository;
 
 @Component
 public class DataInitializer implements CommandLineRunner {
 
     private final CouponRepository couponRepository;
+    private final CouponIssueRepository couponIssueRepository;
     private final StringRedisTemplate redisTemplate;
 
-    public DataInitializer(CouponRepository couponRepository, StringRedisTemplate redisTemplate) {
+    public DataInitializer(
+            CouponRepository couponRepository,
+            CouponIssueRepository couponIssueRepository,
+            StringRedisTemplate redisTemplate) {
+
         this.couponRepository = couponRepository;
+        this.couponIssueRepository = couponIssueRepository;
         this.redisTemplate = redisTemplate;
     }
 
     @Override
-    public void run(String... args) throws Exception {
-        Coupon coupon;
-        if (couponRepository.count() == 0) {
-            coupon = couponRepository.save(new Coupon("선착순 쿠폰", 500));
-            System.out.println("쿠폰 생성(ID: " + coupon.getId());
-        } else {
-            coupon = couponRepository.findById(1L).orElse(null);
-        }
+    public void run(String... args) {
+        // 1. 기존 발급 데이터 전체 삭제
+        couponIssueRepository.deleteAll();
+        // 2. 쿠폰 확인 / 생성
+        Coupon coupon = couponRepository.findById(1L)
+                .orElseGet(() ->
+                        couponRepository.save(
+                                new Coupon("선착순 쿠폰", 500)
+                        )
+                );
 
-        if (coupon != null) {
-            String stockKey = "coupon:" + coupon.getId() + ":stock";
-            String usersKey = "coupon:" + coupon.getId() + ":users";
+        // 3. Redis 키 생성
+        String stockKey = "coupon:" + coupon.getId() + ":stock";
+        String usersKey = "coupon:" + coupon.getId() + ":users";
 
-            redisTemplate.opsForValue().set(stockKey, String.valueOf(coupon.getTotalQuantity()));
-            redisTemplate.delete(usersKey);
+        // 4. Redis 기존 데이터 삭제
+        redisTemplate.delete(stockKey);
+        redisTemplate.delete(usersKey);
 
-            System.out.println("Redis 세팅: " + stockKey + " = " + coupon.getTotalQuantity());
-        }
+        // 5. Redis 재고 500개로 초기화
+        redisTemplate.opsForValue()
+                .set(stockKey, String.valueOf(coupon.getTotalQuantity()));
     }
 }
