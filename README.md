@@ -159,20 +159,50 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 
 ### Redis 서버 장애 대응
 
-문제 상황
+**문제 상황**
 > Redis 장애 발생 시 쿠폰 발급 로직 중단
 
-테스트
+**테스트**
 > Redis 프로세스 강제 종료
 
-검증
-→ HTTP Error
-→ 초과 발급 여부
-→ Redis 복구 후 정상 처리
+**검증**
+> scenarios: 
+>     executor: 'constant-arrival-rate',
+>     rate:  500,
+>     timeUnit: '1s',
+>     duration: '30s',
+>     preAllocatedVUs: 100,
+>     maxVUs: 1000,
 
-결과
-> 실제 수치 이미지 
+`0~10초 Redis 정상 → 10초 Resdis stop → 20초 Redis start`
 
+### 결과
+<img width="404" height="197" alt="Image" src="https://github.com/user-attachments/assets/cd520926-0165-4895-8e98-7dcfa3a17b6e" />
+
+<img width="353" height="179" alt="Image" src="https://github.com/user-attachments/assets/923fdd17-b686-4dd3-97f5-19c39a5fabdc" />
+
+#### 장애 구간(10~20초) 예외 처리 및 Latency 영향
+
+> Redis stop 상태 동안 들어온 요청은 애플리케이션 예외 핸들링을 통해 503 Service Unavailable 응답으로 차단되었다.
+
+> Redis Connection Timeout 대기 시간으로 인해 Max Latency 18.54s가 발생하였으며, Threads Blocking으로 인한 k6의 dropped_iterations(8,378건)가 관측되었다.
+
+#### 데이터 정합성 확보
+
+> 설정된 선착순 수량 500개에 대해 k6 지표상 200 OK 500건, DB 실제 저장 500건으로 초과 발급 및 유실 없이 완벽히 일치했다.
+
+
+>  Redis 재부팅 후 메모리가 비어있는 상태였지만, Kafka Consumer 및 DB 단의 수량 검증 로직이 정확히 작동하여 목표 수량 500개가 채워진 즉시 이후 들어온 요청들을 전부 400 Bad Request로 차단했다. (거짓 성공 응답 0건)
+
+**결론**: Redis 장애 환경에서도 Kafka 메시지 큐의 영속성과 Consumer의 순차 검증을 통해 초과 발급 없이 정합성을 확보했다.
+
+#### 추후 개선 과제 
+> Redis AOF 영속화 옵션 활성화 (appendonly yes)
+> Redis 재부팅 시 장애 직전의 재고 상태를 복원하여, Kafka Consumer 및 DB 단까지 불필요한 초과 발급 요청 메시지가 전달되는 현상 자체를 1차 선단(Redis)에서 완벽히 방어.
+
+
+> Redis Client Timeout 단축 (Fast-Fail 적용)
+> Redis 장애 단락 시 스레드가 최장 18초간 블로킹되는 병목을 방지하기 위해 Connection/Read Timeout을 200ms~500ms 수준으로 단축 설정.
 ---
 
 ### Kafka Consumer 장애 및 Lag 누적
