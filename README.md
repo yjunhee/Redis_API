@@ -19,7 +19,7 @@
 
 ---
 
-## 기술 스택
+### 기술 스택
 
 | 분류 | 기술 스택 |
 | :--- | :--- |
@@ -29,7 +29,7 @@
 
 ---
 
-## 시스템 아키텍처
+### 시스템 아키텍처
 
 <img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/606b3a4d-bb09-4da0-86ea-f7da3ab961c6" />
 
