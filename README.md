@@ -353,20 +353,24 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 
 ### 결과
 
-**- Target VU : 500**
+**- Target VU : 500** 
+<br>
 <img width="692" height="261" alt="Image" src="https://github.com/user-attachments/assets/81fa3082-0708-4f8b-9101-86c74cb349b0" />
 
 **- Target VU : 1000**
+<br>
 <img width="698" height="278" alt="Image" src="https://github.com/user-attachments/assets/e2b1c681-3a29-4f36-9081-9ad75df8d004" />
 
-
 **- Target VU : 2000**
+<br>
 <img width="699" height="281" alt="Image" src="https://github.com/user-attachments/assets/a9211971-c68a-434e-b815-254b57da7eb0" />
 
 **- Target VU : 5000**
+<br>
 <img width="720" height="279" alt="Image" src="https://github.com/user-attachments/assets/3f290831-c2a5-4dce-9519-bba11f063dc4" />
 
 **- Target VU : 10000**
+<br>
 <img width="721" height="280" alt="Image" src="https://github.com/user-attachments/assets/0f3e19d9-07c3-4521-bf15-e8524cfad92f" />
 
 ### 테스트 결과 요약
