@@ -229,14 +229,17 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 **결과**
 
 ※ k6 테스트 결과
+<br>
 <img width="361" height="183" alt="Image" src="https://github.com/user-attachments/assets/72d460fa-3fef-4baf-aa42-a63f6fd2a032" />
 
 ※ Lag 누적과 DB 미저장 상태 확인
+<br>
 <img width="624" height="142" alt="Image" src="https://github.com/user-attachments/assets/eff120a6-9854-4849-8d89-bebbf706dbed" />
 
 <img width="570" height="381" alt="Image" src="https://github.com/user-attachments/assets/f28708cd-a858-404b-afd7-4bb6f2b5e643" />
 
 ※ Lag 소모와 DB 재처리 확인
+<br>
 <img width="633" height="151" alt="Image" src="https://github.com/user-attachments/assets/700a0500-74be-4269-a715-c75c08bdaf79" />
 
 <img width="545" height="392" alt="Image" src="https://github.com/user-attachments/assets/96d1b858-2ec4-4011-80af-7e74243ac505" />
