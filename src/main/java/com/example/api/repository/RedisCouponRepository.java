@@ -56,7 +56,6 @@ public class RedisCouponRepository {
         if (result == null) {
             throw new IllegalStateException("쿠폰 발급 실패했습니다.");
         }
-
         return result;
     }
 }

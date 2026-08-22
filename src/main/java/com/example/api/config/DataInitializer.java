@@ -27,7 +27,7 @@ public class DataInitializer implements CommandLineRunner {
 
     @Override
     public void run(String... args) {
-        // 1. 기존 발급 데이터 전체 삭제
+        // 1. 기존 발급 데이터 삭제
         couponIssueRepository.deleteAll();
         // 2. 쿠폰 확인 / 생성
         Coupon coupon = couponRepository.findById(1L)

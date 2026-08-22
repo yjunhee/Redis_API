@@ -9,7 +9,6 @@ import com.example.api.dto.CouponIssueMessage;
 public class CouponKafkaProducer {
 
     private static final String TOPIC = "coupon-issue";
-
     private final KafkaTemplate<String, CouponIssueMessage> kafkaTemplate;
 
     public CouponKafkaProducer(
@@ -31,27 +30,15 @@ public class CouponKafkaProducer {
 
             if (ex != null) {
                 System.err.println(
-                        "Kafka 전송 실패: couponId="
-                        + couponId
-                        + ", userId="
-                        + userId
+                        "Kafka 전송 실패"
                 );
-
                 ex.printStackTrace();
-
                 return;
             }
-
             System.out.println(
-                    "Kafka 전송 성공: topic="
-                    + result.getRecordMetadata().topic()
-                    + ", partition="
-                    + result.getRecordMetadata().partition()
-                    + ", offset="
-                    + result.getRecordMetadata().offset()
-                    + ", userId="
-                    + userId
+                    "Kafka 전송 성공"
             );
         });
     }
 }
+

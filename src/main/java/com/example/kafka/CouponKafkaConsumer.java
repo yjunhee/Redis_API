@@ -25,10 +25,7 @@ public class CouponKafkaConsumer {
     public void consume(CouponIssueMessage message) {
 
         System.out.println(
-            "Kafka 메시지 수신: couponId="
-            + message.getCouponId()
-            + ", userId="
-            + message.getUserId()
+            "Kafka 메시지 수신"
         );
 
         couponIssueRepository.save(
