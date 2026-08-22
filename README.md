@@ -126,11 +126,11 @@
 ### 결과 분석
 
 > #### 초기 Redis RTT로 인한 정합성 문제
-> 싱글 스레드 기반 Redis를 도입했으나, `조회 → 검증 → 발급` 명령 사이의 **네트워크 RTT(Round Trip Time)**사이 다른 요청들이 침범하면서 Race Condition이 발생하여 정합성이 깨지는 현상이 발생했다. 이를 해결하기 위해 중복 검증과 `조회 → 검증 → 발급` 과정을  
+> 싱글 스레드 기반 Redis를 도입했으나, `조회 → 검증 → 발급` 명령 간 **네트워크 RTT(Round Trip Time)**발생으로 인해 명령 사이에 다른 요청들이 침범하면서 Race Condition이 발생하여 정합성이 깨지는 현상이 발생했다. 이를 해결하기 위해 중복 검증과 `조회 → 검증 → 발급` 과정을  
 > **Lua Script로 묶어 원자적(Atomic) 연산으로** 처리하게 함으로써 In-Memory 단에서 데이터 정합성을 확보했다.
 
 > #### DB Synchronous Write 병목으로 인한 응답 지연
-> Redis를 활용해 In-Memory 단에서 원자적(Atomic) 연산을 처리하더라도, HTTP 요청 주기 내에서 DB에 동기(Synchronous) 방식으로 데이터를 저장하면  **RDBMS I/O 병목 및 Connection Pool 고갈**로 인해 전체 응답 지연이 발생하였다. 이를 해결하기 위해 **Kafka 메시지 큐**를 도입하여 DB 쓰기 트랜잭션을 **비동기화**하였다.  Redis에서 검증 직후 Kafka로 이벤트를 발행하고, 클라이언트에게 즉시 응답(Early Return)하여 응답 속도를 최소화했으며, **Kafka Consumer를 통해 DB 저장을 HTTP 요청 처리 경로에서 분리하여 DB I/O 부하를 비동기 처리 영역으로 격리**하고 메시지 내구성(Durability)을 확보했다.
+> Redis를 활용해 In-Memory 단에서 원자적(Atomic) 연산을 처리하더라도, HTTP 요청 주기 내에서 DB에 동기(Synchronous) 방식으로 데이터를 저장하면  **RDBMS I/O 병목 및 Connection Pool 고갈**로 인해 전체 응답 지연이 발생하였다. 이를 해결하기 위해 **Kafka 메시지 큐**를 도입해 DB 쓰기 트랜잭션을 **비동기화**했 다. Redis 검증 직후 Kafka로 이벤트를 발행하고 클라이언트에게 즉시 응답(Early Return)하여 응답 시간을 최소화했다. 또한 **Kafka Consumer가 DB 저장을 HTTP 요청 처리 경로에서 밖에서 비동기로 처리하게 하여 DB I/O 병목을 격리**하고 메시지 내구성(Durability)을 확보했다.
 
 > #### TPS 및 Latency 개선
 > DB에 직접 조회/수정 대신 Redis In-Memory 연산 및 Kafka 메시지 발행만 수행하여 응답 시간을 최소화하여, 
@@ -167,14 +167,14 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 
 **검증**
 > scenarios: 
->     executor: 'constant-arrival-rate',
->     rate:  500,
->     timeUnit: '1s',
->     duration: '30s',
->     preAllocatedVUs: 100,
->     maxVUs: 1000,
+> - executor: 'constant-arrival-rate',
+> - rate:  500,
+> - timeUnit: '1s',
+> - duration: '30s',
+> - preAllocatedVUs: 100,
+> - maxVUs: 1000,
 
-`0~10초 Redis 정상 → 10초 Resdis stop → 20초 Redis start`
+`0~10초 Redis 정상 → 10초 Redis stop → 20초 Redis start`
 
 ### 결과
 <img width="404" height="197" alt="Image" src="https://github.com/user-attachments/assets/cd520926-0165-4895-8e98-7dcfa3a17b6e" />
@@ -183,7 +183,7 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 
 #### 장애 구간(10~20초) 예외 처리 및 Latency 영향
 
-> Redis stop 상태 동안 들어온 요청은 애플리케이션 예외 핸들링을 통해 503 Service Unavailable 응답으로 차단되었다.
+> Redis stop 구간 동안 들어온 요청은 애플리케이션 예외 핸들링을 통해 503 Service Unavailable 응답을 반환하여 차단했다.
 
 > Redis Connection Timeout 대기 시간으로 인해 Max Latency 18.54s가 발생하였으며, Threads Blocking으로 인한 k6의 dropped_iterations(8,378건)가 관측되었다.
 
@@ -192,13 +192,14 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 > 설정된 선착순 수량 500개에 대해 k6 지표상 200 OK 500건, DB 실제 저장 500건으로 초과 발급 및 유실 없이 완벽히 일치했다.
 
 
->  Redis 재부팅 후 메모리가 비어있는 상태였지만, Kafka Consumer 및 DB 단의 수량 검증 로직이 정확히 작동하여 목표 수량 500개가 채워진 즉시 이후 들어온 요청들을 전부 400 Bad Request로 차단했다. (거짓 성공 응답 0건)
+>  Redis 재부팅 후 메모리가 비어있는 상태였지만, Kafka Consumer 및 DB 단의 수량 검증 로직이 정확히 작동하여 목표 수량 500개가 채워진 즉시 이후 들어온 요청들을 전부 400 Bad Request로 차단했다. (거짓 성공 응답 0건) 
+> 또한 DB레벨에서 (coupon_id, user_id)로 unique 제약 조건을 설정하여 중복을 방지하였다.
 
 **결론**: Redis 장애 환경에서도 Kafka 메시지 큐의 영속성과 Consumer의 순차 검증을 통해 초과 발급 없이 정합성을 확보했다.
 
 #### 추후 개선 과제 
-> Redis AOF 영속화 옵션 활성화 (appendonly yes)
-> Redis 재부팅 시 장애 직전의 재고 상태를 복원하여, Kafka Consumer 및 DB 단까지 불필요한 초과 발급 요청 메시지가 전달되는 현상 자체를 1차 선단(Redis)에서 완벽히 방어.
+> Redis AOF(Append Only File) 영속화 적용
+> Redis 재부팅 시 장애 직전의 재고 상태를 복원하여, Kafka Consumer 및 DB 까지 불필요한 초과 발급 요청 메시지가 유입되는 현상 자체를 Redis에서 방어함.
 
 
 > Redis Client Timeout 단축 (Fast-Fail 적용)
@@ -207,20 +208,68 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 
 ### Kafka Consumer 장애 및 Lag 누적
 
-문제 상황
-> Consumer 장애로 DB 저장 지연
+**문제 상황**
+> Consumer 장애 발생 시 Kafka 메시지가 처리되지 못하고 DB 저장 지연
 
-테스트
-> Consumer 중단 후 쿠폰 요청 발생
+**테스트**
+> Consumer 프로세스 중지 후 쿠폰 발급 요청
+> Consumer를 실행하여 누적된 메시지들 소모 확인
 
-검증
-→ Kafka Lag 증가
-→ MySQL 저장 지연
-→ Consumer 복구 후 Lag 감소
-→ 최종 발급 건수
+**검증**
+> scenarios: 
+> - executor: 'constant-arrival-rate',
+> - rate:  500,
+> - timeUnit: '1s',
+> - duration: '30s',
+> - preAllocatedVUs: 100,
+> - maxVUs: 1000,
 
-결과
-> 실제 수치 이미지
+`Consumer Stop → 쿠폰 발급 요청 → Kafka Lag 누적 → Consumer Start → 메시지 재처리`
+
+**결과**
+
+※ k6 테스트 결과
+<img width="361" height="183" alt="Image" src="https://github.com/user-attachments/assets/72d460fa-3fef-4baf-aa42-a63f6fd2a032" />
+
+※ Lag 누적과 DB 미저장 상태 확인
+<img width="624" height="142" alt="Image" src="https://github.com/user-attachments/assets/eff120a6-9854-4849-8d89-bebbf706dbed" />
+
+<img width="570" height="381" alt="Image" src="https://github.com/user-attachments/assets/f28708cd-a858-404b-afd7-4bb6f2b5e643" />
+
+※ Lag 소모와 DB 재처리 확인
+<img width="633" height="151" alt="Image" src="https://github.com/user-attachments/assets/700a0500-74be-4269-a715-c75c08bdaf79" />
+
+<img width="545" height="392" alt="Image" src="https://github.com/user-attachments/assets/96d1b858-2ec4-4011-80af-7e74243ac505" />
+
+<img width="248" height="39" alt="Image" src="https://github.com/user-attachments/assets/e0b288a1-9fbe-4124-aad9-d77a70754d8c" />
+
+
+#### Consumer 장애 구간 메시지 적재
+
+> 테스트 시작 전 Kafka Consumer를 중지한 상태에서 500 req/s의  발급 요청을 발생시켰다.
+> Consumer 중지 상태에서도 Redis는 쿠폰 발급을 정상 처리했으며, Producer 역시 발급 이벤트를 Kafka 토픽으로 정상 발행했다.
+> 이 과정에서 Consumer가 중지되어 있어 Kafka 메시지를 DB로 전달하지 못하면서 각 Partition에 처리되지 않은 메시지가 Lag형태로 누적되는 것을 확인했다.
+
+#### Kafka Lag 누적 관측
+
+> Consumer 장애 상태 동안 Partition별 Lag를 확인한 결과, Kafka에 처리되지 않은 메시지가 누적되는 것을 확인했다.
+
+#### Consumer 복구 및 메시지 재처리
+
+> 부하 테스트 종료 후 Kafka Consumer를 재실행했다.
+> Consumer가 재가동되면서 Kafka에 누적되어 있던 메시지를 순차적으로 소비하였으며, Lag가 0이 된 것을 확인했다.
+> Consumer 장애 중 적재된 메시지가 유실되지 않고 정상적으로 재처리되었음을 확인했다.
+
+#### 데이터 정합성 확보
+
+> Redis에서 최종적으로 차감된 쿠폰 수량과 Consumer 복구 후 MySQL에 저장된 쿠폰 발급 데이터의 수량을 비교하였다.
+> Redis 발급 수량 [263건], MySQL 저장 수량 [263건]으로 일치하여 Consumer 장애 및 복구 과정에서 쿠폰 발급 데이터의 유실이 발생하지 않았음을 확인했다.
+
+**결론**: Kafka Consumer 장애 상황에서도 발급 이벤트가 Kafka에 보존되어 메시지 유실 없이 누적되었으며, Consumer 복구 후 미처리 메시지가 정상적으로 재처리되어 Kafka Lag이 0으로 감소하고 최종적으로 MySQL에 데이터가 정상 반영됨을 확인하였다.
+
+#### 추후 개선 과제
+
+> Kafka Consumer 장애 발생 시 Lag 증가량을 모니터링하고 임계치 초과 시 관리자에게 알림을 제공하도록 Consumer Lag 모니터링 및 Alert 시스템 구축
 
 ---
 
