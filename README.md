@@ -192,7 +192,7 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 > 설정된 선착순 수량 500개에 대해 k6 지표상 200 OK 500건, DB 실제 저장 500건으로 초과 발급 및 유실 없이 완벽히 일치했다.
 
 
->  Redis 재부팅 후 메모리가 비어있는 상태였지만, Kafka Consumer 및 DB 단의 수량 검증 로직이 정확히 작동하여 목표 수량 500개가 채워진 즉시 이후 들어온 요청들을 전부 400 Bad Request로 차단했다. (거짓 성공 응답 0건) 
+>  Redis 재부팅 후 메모리가 비어있는 상태였지만, Kafka Consumer 및 DB 단의 수량 검증 로직이 작동하여 목표 수량 500개가 채워진 이후 들어온 요청들을 전부 400 Bad Request로 차단했다. (거짓 성공 응답 0건) 
 > 또한 DB레벨에서 (coupon_id, user_id)로 unique 제약 조건을 설정하여 중복을 방지하였다.
 
 **결론**: Redis 장애 환경에서도 Kafka 메시지 큐의 영속성과 Consumer의 순차 검증을 통해 초과 발급 없이 정합성을 확보했다.
@@ -278,34 +278,123 @@ Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결�
 
 ### MySQL 서버 장애 및 Eventual Consistency
 
-문제 상황
-> MySQL 장애로 인한 DB 저장 실패
+**문제 상황**
+> MySQL 장애로 인해 DB 저장 실패
 
-테스트
-> MySQL 강제 종료 상태에서 쿠폰 발급
+**테스트**
+> MySQL 프로세스 중지 후 쿠폰 발급 요청
+> MySQL을 실행하고 테이블 확인 및 Redis와 정합성 체크
 
-검증
-→ Redis 발급 성공
-→ Kafka 메시지 적재
-→ Consumer 처리 실패
-→ MySQL 복구
-→ 메시지 재처리
-→ 최종 정합성
+**검증**
+> scenarios: 
+> - executor: 'constant-arrival-rate',
+> - rate:  500,
+> - timeUnit: '1s',
+> - duration: '30s',
+> - preAllocatedVUs: 100,
+> - maxVUs: 1000,
 
-결과
-> 실제 수치 이미지
+`MySQL Stop → 쿠폰 발급 요청 → MySQL Start → DB 저장 확인`
+
+**결과**
+※ k6 테스트 결과
+<br>
+<img width="360" height="189" alt="Image" src="https://github.com/user-attachments/assets/f0ebe565-3da6-4c58-8c34-7e6eff608fb8" />
+
+※ Lag 누적과 소모 확인
+<br>
+<img width="625" height="148" alt="Image" src="https://github.com/user-attachments/assets/27e43041-c2c6-4e06-969d-bfb110a970f0" />
+
+<img width="620" height="139" alt="Image" src="https://github.com/user-attachments/assets/f5026b6c-747a-4f8a-92f4-08a7888cc060" />
+
+※ 정합성 확인
+<br>
+<img width="139" height="51" alt="Image" src="https://github.com/user-attachments/assets/77e189b2-d210-4555-a70d-0beba5d80aa5" />
+
+<img width="253" height="35" alt="Image" src="https://github.com/user-attachments/assets/1f6c167a-4974-4615-8438-b99854551752" />
+
+
+#### MySQL 장애 구간의 DB 저장 실패
+
+> 서버가 정상적으로 동작하는 상태에서 MySQL만 중지한 상태에서의 DB 장애 상황을 재현했다.
+> MySQL 장애 상태에서도 Redis 재고 차감과 Kafka Producer의 이벤트 발행은 정상적으로 수행되었다. 반면 Consumer는 DB와 연결 실패로 인한 재시도가 발생하면서 메시지가 소비되지 못하고 Partition에 Lag 형태로 누적되었다.
+
+#### MySQL 복구 후 메시지 재처리
+
+> MySQL 복구 이후 Kafka Consumer가 정상적으로 DB 저장을 재개하면서 장애 기간 동안 누적되었던 Kafka Lag를 소모했다.
+> 최종적으로 모든 Partition의 Lag가 0으로 감소하여, MySQL 장애 동안 처리되지 못했던 메시지가 복구 이후 정상적으로 처리되었음을 확인했다.
+
+#### 데이터 정합성 확보
+
+> Redis의 최종 재고와 MySQL의 실제 발급 데이터를 비교하여 장애 복구 이후 데이터 정합성을 검증하였다.
+> 총 500개 수량 중 Redis 잔여 재고 [245개], MySQL 실제 저장 데이터 [255건]으로, 합산 500건이 정확히 일치함을 확인했다.
+> 최종적으로 Kafka Lag 또한 0에 도달하여 `Redis 처리 → Kafka  이벤트 누 → MySQL 저장` 과정에서의 데이터 정합성을 확인했다.
+
+**결론**: MySQL 장애 상황에서도 Redis를 통한 쿠폰 발급 및 Kafka Lag 적재는 정상적으로 수행되었으며, DB 저장이 지연되더라도 Kafka에 메시지가 보존되었다. 이후 MySQL 복구 시 Consumer가 미처리 메시지를 재처리하여 Kafka Lag가 0으로 감소하고 최종적으로 MySQL에 모든 발급 데이터가 반영되는 Eventual Consistency 구조를 검증했다.
+
+#### 추후 개선 과제
+
+> Dead Letter Queue(DLQ) 도입
+> 반복적인 DB 저장 실패가 발생하는 메시지를 별도의 DLQ로 분리하여 일반 메시지 처리 지연을 방지하고 장애 원인을 추적할 수 있도록 개선한다.
+
+> Kafka Consumer Lag 모니터링
+> Consumer 장애 및 MySQL 장애로 인한 Lag 증가를 실시간으로 모니터링하고, 일정 임계치를 초과할 경우 관리자에게 알림을 제공하도록 개선한다.
 
 ---
 
 ## Redis 점진적 부하 한계 테스트
-| Target Load | 실제 TPS (초당 처리량) | p(95) Latency (응답 속도) | 데이터 정합성 (Integrity) | CPU | Memory |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **100req/s** | **-** | **-** | **-** | - | - |
-| **500req/s** | **-** | **-** | **-** | - | - |
-| **1000req/s** | **-** | **-** | **-** | - | - |
-| **2000req/s** | **-** | **-** | **-** | - | - |
-| **5000req/s** | **-** | **-** | **-** | - | - |
+
+### 테스트 조건
+> scenarios: 
+> - executor: 'per-vu-iterations'
+> - iterations: 1
+> - vus: `500 → 1,000 → 2,000 → 5,000 → 10,000`
+> - maxDuration: '60s'
 
 ### 결과
--
 
+**- Target VU : 500**
+<img width="692" height="261" alt="Image" src="https://github.com/user-attachments/assets/81fa3082-0708-4f8b-9101-86c74cb349b0" />
+
+**- Target VU : 1000**
+<img width="698" height="278" alt="Image" src="https://github.com/user-attachments/assets/e2b1c681-3a29-4f36-9081-9ad75df8d004" />
+
+
+**- Target VU : 2000**
+<img width="699" height="281" alt="Image" src="https://github.com/user-attachments/assets/a9211971-c68a-434e-b815-254b57da7eb0" />
+
+**- Target VU : 5000**
+<img width="720" height="279" alt="Image" src="https://github.com/user-attachments/assets/3f290831-c2a5-4dce-9519-bba11f063dc4" />
+
+**- Target VU : 10000**
+<img width="721" height="280" alt="Image" src="https://github.com/user-attachments/assets/0f3e19d9-07c3-4521-bf15-e8524cfad92f" />
+
+### 테스트 결과 요약
+
+| Target VU | 실제 TPS | p(95) Latency | HTTP 200 / 정합성 | 연결실패 | 
+| :--- | :--- | :--- | :--- | :--- | 
+| **500req/s** | **257req/s** | **1.90s** | **500건(만족)** | **0건** | 
+| **1000req/s** | **424req/s** | **2.23s** | **500건(만족)** | **0건** | 
+| **2000req/s** | **721req/s** | **2.45s** | **500건(만족)** | **0건** |
+| **5000req/s** | **1024req/s** | **3.86s** | **500건(만족)** | **836건** | 
+| **10000req/s** | **1918req/s** | **3.54s** | **500건(만족)** | **3711건** | 
+
+### 분석
+
+#### 부하 증가에 따른 처리량 변화
+
+> 500 VU에서 **257 TPS**를 처리했으며, 부하를 1,000 → 2,000 → 5,000 → 10,000 VU로 증가시키자 처리량은 각각 **424 → 721 → 1,024 → 1,918 TPS**까지 증가했다.
+> 다만 VU 증가폭에 비해 실제 처리량 증가폭은 점차 감소했다. 이는 부하가 증가하면서 서버의 스레드 및 네트워크 연결 처리 능력이 병목으로 작용하기 시작했음을 의미한다.
+
+#### 5,000 VU 이상 구간 연결 실패 발생
+
+> 5,000 VU부터 `connection refused` 에러가 발생(836건)하고, 10,000 VU에서는 3,711건으로 급증했.
+> 실제 로그에서도 다음과 같은 오류코드가 확인되었는데,
+> `dial tcp 127.0.0.1:8080: connectex: No connection could be made because the target machine actively refused it.`
+> 해당 에러는 연산 실패가 아닌, **Tomcat/OS 레벨의 연결 수용 한계에 도달하면서 8080 포트에 대한 connection refused가 발생한 것**으로 판단된다.
+
+*10,000 VU의 p(95) 응답시간(3.54s)이 5,000 VU(3.86s)보다 짧게 측정된 원인은, 다수의 요청이 connection refused로 즉시 실패하여 실제 서버 처리 요청의 latency만 집계된 결과다.
+
+#### 높은 부하 환경 속 데이터 정합성 보장
+
+> 연결 거부 에러가 대량 발생한 10,000 VUs 테스트 환경에서도, **중복/초과 발급 없이 정확히 500건의 쿠폰만 성공 처리**하여 데이터 정합성을 확보함.
