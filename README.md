@@ -45,6 +45,11 @@
 | k6 | v2.2.0 |
 | Tomcat Max Threads | 1,000 | 
 
+*테스트 환경에서는 매 부하 테스트마다 쿠폰/Redis 상태를 초기화하기 위해
+DataInitializer를 사용한다.
+
+*환경변수 설정 필요
+
 ### 테스트 시나리오
 > **Target Scenario**: 
 > - executor: shared-iterations
