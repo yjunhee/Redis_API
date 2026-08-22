@@ -3,19 +3,17 @@ import { check } from 'k6';
 
 export const options = {
   scenarios: {
-    redis_failure_test: {
-      executor: 'constant-arrival-rate',
-      rate:  500,
-      timeUnit: '1s',
-      duration: '30s',
-      preAllocatedVUs: 100,
-      maxVUs: 1000,
+    coupon_issue_scenario: {
+      executor: 'shared-iterations',
+      iterations: 500,
+      vus: 500,
+      maxDuration: '60s',
     },
   },
 };
 
 export default function () {
-  const userId = __VU;
+  const userId = `${__VU}-${__ITER}`;
   const couponId = 1;
 
   //const url =

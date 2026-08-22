@@ -9,7 +9,7 @@ redis
 
 kafka cd C:\kafka
 > .\bin\windows\kafka-storage.bat random-uuid
-> .\bin\windows\kafka-storage.bat format -t Jw6WnxuFRDuVGgpwwsGvKw -c .\config\server.properties
+> .\bin\windows\kafka-storage.bat format -t tp0q1FtyQXyPEkbW95B4gQ -c .\config\server.properties
 > .\bin\windows\kafka-server-start.bat .\config\server.properties
 
 kafka topic 생성

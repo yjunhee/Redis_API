@@ -4,13 +4,14 @@ import { check } from 'k6';
 export const options = {
   scenarios: {
     coupon_issue_scenario: {
-      executor: 'shared-iterations',
-      iterations: 1000,
-      vus: 1000,
+      executor: 'per-vu-iterations',
+      vus: 10000,
+      iterations: 1,
       maxDuration: '60s',
     },
   },
 };
+
 
 export default function () {
   const userId = __VU;

@@ -2,7 +2,7 @@ package com.example.api.service;
 
 import org.springframework.stereotype.Service;
 
-import com.example.kafka.CouponKafkaProducer;
+import com.example.api.kafka.CouponKafkaProducer;
 import com.example.api.repository.RedisCouponRepository;
 
 @Service
