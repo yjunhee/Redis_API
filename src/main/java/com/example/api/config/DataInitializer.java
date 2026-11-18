@@ -3,12 +3,18 @@ package com.example.api.config;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
 import com.example.api.domain.Coupon;
 import com.example.api.repository.CouponIssueRepository;
 import com.example.api.repository.CouponRepository;
 
 @Component
+@ConditionalOnProperty(
+        name = "app.initialize-data",
+        havingValue = "true",
+        matchIfMissing = false
+)
 public class DataInitializer implements CommandLineRunner {
 
     private final CouponRepository couponRepository;
