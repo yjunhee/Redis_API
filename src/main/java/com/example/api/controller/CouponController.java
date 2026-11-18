@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.api.kafka.KafkaPublishException;
 import com.example.api.service.RdbmsCouponService;
 import com.example.api.service.RedisCouponService;
 
@@ -33,16 +34,13 @@ public class CouponController {
     ) {
         try {
             rdbmsCouponService.issue(couponId, userId);
-
             return ResponseEntity.ok("쿠폰 발급 성공");
 
         } catch (IllegalArgumentException | IllegalStateException e) {
-            return ResponseEntity.badRequest()
-                    .body(e.getMessage());
+            return ResponseEntity.badRequest().body(e.getMessage());
 
         } catch (Exception e) {
-            return ResponseEntity.status(500)
-                    .body("서버 오류가 발생했습니다.");
+            return ResponseEntity.status(500).body("서버 오류가 발생했습니다.");
         }
     }
 
@@ -54,16 +52,16 @@ public class CouponController {
     ) {
         try {
             redisCouponService.issue(couponId, userId);
+            return ResponseEntity.ok("쿠폰 발급 요청 접수");
 
-            return ResponseEntity.ok("쿠폰 발급 성공");
+        } catch (KafkaPublishException e) {
+            return ResponseEntity.status(503).body( "발행 결과를 확인하지 못했습니다." + "발급 상태 확인이 필요합니다.");
 
         } catch (IllegalArgumentException | IllegalStateException e) {
-            return ResponseEntity.badRequest()
-                    .body(e.getMessage());
+            return ResponseEntity.badRequest().body(e.getMessage());
 
         } catch (Exception e) {
-            return ResponseEntity.status(500)
-                    .body("서버 오류가 발생했습니다.");
+            return ResponseEntity.status(500).body("서버 오류가 발생했습니다.");
         }
     }
 }

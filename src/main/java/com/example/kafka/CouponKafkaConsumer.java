@@ -1,40 +1,76 @@
-package com.example.kafka;
+package com.example.api.kafka;
 
-import org.springframework.kafka.annotation.KafkaListener;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
-import com.example.api.domain.CouponIssue;
 import com.example.api.dto.CouponIssueMessage;
-import com.example.api.repository.CouponIssueRepository;
 
 @Component
-public class CouponKafkaConsumer {
+public class CouponKafkaProducer {
 
-    private final CouponIssueRepository couponIssueRepository;
+    private static final Logger log=LoggerFactory.getLogger(CouponKafkaProducer.class);
+    private static final String TOPIC="coupon-issue";
+    private final KafkaTemplate<String, CouponIssueMessage> kafkaTemplate;
 
-    public CouponKafkaConsumer(
-            CouponIssueRepository couponIssueRepository
-    ) {
-        this.couponIssueRepository = couponIssueRepository;
+    public CouponKafkaProducer(KafkaTemplate<String, CouponIssueMessage> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
     }
 
-    @KafkaListener(
-        topics = "coupon-issue",
-        groupId = "coupon-consumer-group"
-    )
-    public void consume(CouponIssueMessage message) {
+    public void send(Long couponId, Long userId) {
+        CouponIssueMessage message =
+                new CouponIssueMessage(couponId, userId);
+        try {
+            kafkaTemplate.send(
+                    TOPIC,
+                    String.valueOf(userId),
+                    message
+            ).get(35, TimeUnit.SECONDS);
 
-        System.out.println(
-            "Kafka 메시지 수신"
-        );
+            log.info(
+                    "Kafka 발행 확인: couponId={}, userId={}",
+                    couponId,
+                    userId
+            );
 
-        couponIssueRepository.save(
-            new CouponIssue(
-                message.getCouponId(),
-                message.getUserId()
-            )
-        );
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
 
-        System.out.println("MySQL 저장 완료");
+            throw new KafkaPublishException(
+                    "Kafka 발행 확인 중 요청 처리가 중단되었습니다.",
+                    e
+            );
+
+        } catch (ExecutionException | TimeoutException e) {
+            log.error(
+                    "Kafka 발행 결과 미확인: couponId={}, userId={}",
+                    couponId,
+                    userId,
+                    e
+            );
+
+            throw new KafkaPublishException(
+                    "Kafka 발행 결과를 확인하지 못했습니다.",
+                    e
+            );
+
+        } catch (RuntimeException e) {
+            log.error(
+                    "Kafka 전송 요청 오류: couponId={}, userId={}",
+                    couponId,
+                    userId,
+                    e
+            );
+
+            throw new KafkaPublishException(
+                    "Kafka 전송 요청을 처리하지 못했습니다.",
+                    e
+            );
+        }
     }
 }
