@@ -1,44 +1,35 @@
-package com.example.api.kafka;
+package com.example.kafka;
 
-import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
+import com.example.api.domain.CouponIssue;
 import com.example.api.dto.CouponIssueMessage;
+import com.example.api.repository.CouponIssueRepository;
 
 @Component
-public class CouponKafkaProducer {
+public class CouponKafkaConsumer {
 
-    private static final String TOPIC = "coupon-issue";
-    private final KafkaTemplate<String, CouponIssueMessage> kafkaTemplate;
-
-    public CouponKafkaProducer(
-            KafkaTemplate<String, CouponIssueMessage> kafkaTemplate
+    private final CouponIssueRepository couponIssueRepository;
+    public CouponKafkaConsumer(
+            CouponIssueRepository couponIssueRepository
     ) {
-        this.kafkaTemplate = kafkaTemplate;
+        this.couponIssueRepository = couponIssueRepository;
     }
 
-    public void send(Long couponId, Long userId) {
+    @KafkaListener(
+            topics = "coupon-issue",
+            groupId = "coupon-consumer-group"
+    )
+    public void consume(CouponIssueMessage message) {
+        System.out.println("Kafka 메시지 수신");
+        couponIssueRepository.save(
+                new CouponIssue(
+                        message.getCouponId(),
+                        message.getUserId()
+                )
+        );
 
-        CouponIssueMessage message =
-                new CouponIssueMessage(couponId, userId);
-
-        kafkaTemplate.send(
-                TOPIC,
-                String.valueOf(userId),
-                message
-        ).whenComplete((result, ex) -> {
-
-            if (ex != null) {
-                System.err.println(
-                        "Kafka 전송 실패"
-                );
-                ex.printStackTrace();
-                return;
-            }
-            System.out.println(
-                    "Kafka 전송 성공"
-            );
-        });
+        System.out.println("MySQL 저장 완료");
     }
 }
-
