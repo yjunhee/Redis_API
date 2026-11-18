@@ -1,409 +1,461 @@
-#  1,000명 동시 접속 환경의 선착순 쿠폰 발급 API
+# 선착순 쿠폰 발급 API
 
-> RDBMS,  Redis 동시성 제어 비교
-> 
-> **1,000명의 동시 요청 환경에서 500장의 선착순 쿠폰을 정확하게 발급하고,
-> 동시성 제어 방식에 따른 성능과 정합성의 Trade-off를 비교 검증한다.**
+> 한정된 수량의 쿠폰을 여러 사용자가 동시에 요청할 때 발생하는 초과 발급 문제를 재현하고, 
+> 처리 방식에 따른 성능과 데이터 일관성의 차이를 확인.
 
----
+## 프로젝트 소개
 
-## 개요
+**1000VUs 환경에서 쿠폰 수량을 500장**으로 설정하고 다음 세 가지 방식을 비교했습니다.
 
-선착순 이벤트는 단시간에 대규모 트래픽이 집중되어 **동시성 이슈(Race Condition)** 및 **데이터베이스 I/O 병목 현상**이 발생하는 대표적인 상황이다.
+- 동시성 제어를 적용하지 않은 MySQL 처리
+- MySQL 비관적 락을 적용한 처리
+- Redis Lua Script와 Kafka를 결합한 비동기 처리
 
-본 프로젝트에서는 **RDBMS(MySQL) 기반의 동시성 제어** 방식과 **Redis 기반의 In-Memory 동시성 제어** 방식을 구현하고, 부하 테스트 도구인 **k6**를 활용해 성능(TPS, Latency) 및 정합성을 비교 검증한다.
+구현 이후에는 Redis, Kafka Consumer, MySQL을 각각 중단하며
+응답 지연, 메시지 적재, 복구 이후의 DB 반영 상태를 확인했습니다.
 
-### 핵심 목표
-- **데이터 정합성 (Data Integrity)**: 1,000건 이상의 동시 요청 환경에서 초과 발급 없이 **정확히 500건만 발급** (Race Condition 차단)
-- **성능향상 및 시스템 안정성**: DB Lock 병목을 제거하여 **TPS 극대화 및 응답 속도(Latency) 최소화**.
+## 기술 스택
 
----
+| 영역 | 사용 기술 |
+| --- | --- |
+| **언어** | Java 17 |
+| **프레임 워크** | Spring Boot 3.3.5, Spring Data JPA |
+| **DB** | MySQL 8.0 |
+| **In-Memory 저장소** | Redis 호환 Memurai |
+| **Messaging** | Apache Kafka 4.3.1 |
+| **테스트 도구** | k6 v2.2.0 |
 
-### 기술 스택
+## 시스템 구성
 
-| 분류 | 기술 스택 |
-| :--- | :--- |
-| **Language / Framework** | Java 17, Spring Boot 3.3.5, Spring Data JPA |
-| **Database** | MySQL 8.0, Redis v4.2.3, Apache Kafka 4.3.1 |
-| **Load Test** | k6 v2.2.0 |
+![시스템 아키텍처](https://github.com/user-attachments/assets/606b3a4d-bb09-4da0-86ea-f7da3ab961c6)
 
----
+### MySQL 기반 처리
 
-### 시스템 아키텍처
+HTTP 요청 안에서 쿠폰 조회, 중복 확인, 수량 확인과 발급 내역 저장을 처리합니다.
 
-<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/606b3a4d-bb09-4da0-86ea-f7da3ab961c6" />
+비관적 락을 사용하는 경우 쿠폰 레코드에 락을 획득한 뒤
+발급 가능 여부를 확인하고 데이터를 저장합니다.
 
-## K6 부하 테스트
-### 테스트 환경
+### Redis + Kafka 기반 처리
+
+1. **Redis Lua Script**에서 사용자 중복과 재고를 확인합니다.
+2. 발급 가능한 경우 재고를 차감하고 사용자를 등록합니다.
+3. 발급 정보를 **Kafka**에 비동기로 전송합니다.
+4. **Consumer**가 메시지를 소비해 MySQL에 발급 내역을 저장합니다.
+
+DB 저장을 HTTP 요청 처리 경로에서 분리한 구조입니다.
+
+> 아래 성능 수치는 Kafka 발행 완료를 기다리지 않고 응답하는
+> 기존 구현에서 측정한 결과입니다.
+> HTTP 200만으로 Kafka 발행 성공이나 MySQL 저장 완료가 보장되지는 않습니다.
+> 이후 코드를 변경한 경우에는 해당 구현의 성능을 별도로 측정해야 합니다.
+
+## 주요 구현
+
+### 1. MySQL 비관적 락
+
+쿠폰 조회에 `PESSIMISTIC_WRITE`를 적용했습니다.
+
+동일 쿠폰의 발급 가능 여부를 판단하는 요청들이
+쿠폰 레코드의 락을 획득한 뒤 처리되도록 구성했습니다.
+
+트랜잭션 내부에서 사용자 중복과 현재 발급 수량을 확인하고
+발급 내역을 저장합니다.
+
+**관련 코드**:
+
+- [RDBMS 발급 서비스](src/main/java/com/example/api/service/RdbmsCouponService.java)
+- [쿠폰 Repository](src/main/java/com/example/api/repository/CouponRepository.java)
+
+### 2. Redis Lua Script
+
+중복 확인과 재고 차감을 개별 명령으로 호출하면,
+명령 사이에 다른 요청이 실행될 수 있습니다.
+
+다음 작업을 **Lua Script** 하나로 묶어 처리했습니다.
+
+1. 사용자 발급 이력 확인
+2. 현재 재고 확인
+3. 재고 차감
+4. 발급 사용자 등록
+
+| 반환값 | 의미 |
+| --- | --- |
+| `-1` | 이미 등록된 사용자 |
+| `0` | 재고가 없거나 재고 키가 없음 |
+| `1` | 재고 차감 및 사용자 등록 완료 |
+
+Lua Script가 보호하는 범위는 Redis 내부의 작업이고,
+Kafka 발행과 MySQL 저장까지 하나의 원자적 작업으로 처리하는 것은 아님.
+
+**관련 코드**:
+
+- [Redis Repository 및 Lua Script](src/main/java/com/example/api/repository/RedisCouponRepository.java)
+- [Redis 발급 서비스](src/main/java/com/example/api/service/RedisCouponService.java)
+
+### 3. Kafka 비동기 DB 저장
+
+Redis에서 처리한 발급 정보를 `coupon-issue` 토픽으로 전달하고,
+Consumer가 MySQL에 저장하도록 구성했습니다.
+
+이 구조에서는 HTTP 응답과 최종 DB 반영 시점이 다릅니다.
+
+Consumer 또는 MySQL이 중단되었을 때 메시지가 대기하는 상태를
+Consumer Lag으로 확인하고, 복구 이후 Lag와 DB 저장 건수를 비교했습니다.
+
+**관련 코드**:
+
+- [Kafka Producer](src/main/java/com/example/api/kafka/CouponKafkaProducer.java)
+- [Kafka Consumer](src/main/java/com/example/kafka/CouponKafkaConsumer.java)
+
+### 4. DB 중복 제약
+
+발급 테이블에 다음 조합의 **unique** 제약을 적용했습니다.
+
+```text
+(coupon_id, user_id)
+```
+
+동일 사용자가 같은 쿠폰을 중복 저장하는 것을 DB에서도 제한합니다.
+
+이 제약은 사용자별 중복을 막는 장치이며,
+서로 다른 사용자에게 발급되는 총수량을 제한하는 장치는 아닙니다.
+
+**관련 코드**:
+
+- [발급 엔티티](src/main/java/com/example/api/domain/CouponIssue.java)
+
+## 부하 테스트
+
+### 측정 환경
+
 | 항목 | 환경 |
-|---|---|
+| --- | --- |
 | OS | Windows 11 |
-| CPU | i3-9100F |
+| CPU | Intel i3-9100F |
 | RAM | 16GB |
-| Redis | Memurai |
+| Redis 환경 | Memurai |
 | Kafka | 4.3.1 |
 | k6 | v2.2.0 |
-| Tomcat Max Threads | 1,000 | 
-
-*테스트 환경에서는 매 부하 테스트마다 쿠폰/Redis 상태를 초기화하기 위해
-DataInitializer를 사용한다.
-
-*환경변수 설정 필요
-
-### 테스트 시나리오
-> **Target Scenario**: 
-> - executor: shared-iterations
-> - iterations: 1000
-> - vus (Virtual Users): 1000
+| Tomcat Max Threads | 1,000 |
 
-#### **Target API**: `POST /coupons/1/issue?userId={userId}`, `POST /coupons/1/issue/redis?userId={userId}`
-#### **검증 기준**: HTTP 200 및 MySQL CouponIssue 테이블 체크
----
+아래 수치는 해당 로컬 환경에서 기록한 실험 결과입니다.
+실제 사용자 운영 환경이나 다른 장비에서의 처리량은 다를 수 있습니다.
 
-### RDBMS(No Lock) 테스트 결과
-<img width="724" height="421" alt="Image" src="https://github.com/user-attachments/assets/61c43217-2a70-489b-8274-1a3e8a2fd989" />
+### 비교 시나리오
 
-| 지표 (Metrics) | 측정 결과 수치 | 비고 및 상태 |
-| :--- | :--- | :--- |
-| **Total Requests** | 1,000 req | 총 요청 건수 |
-| **Throughput (TPS)** | **243.19 req/s** | 초당 처리량 |
-| **HTTP 200** | **54.9% (549건)** | 쿠폰 발급 성공 |
-| **HTTP 400** | **45.1% (451건)** | 쿠폰 발급 실패 |
-| **p(95) Latency** | **3.89s(3,890ms)** | 상위 5% 요청의 응답 시간 |
-| **Max Latency** | **3.97s (3,970ms)** | 최대 응답 시간 |
-| **데이터 정합성 (Integrity)** | **49건 초과 발급** | Race Condition 발생  |
+| 항목 | 설정 |
+| --- | --- |
+| Executor | `shared-iterations` |
+| **VUs** | 1,000 |
+| 총 Iterations | 1,000 |
+| 초기 쿠폰 수량 | 500 |
 
----
+요청 대상:
 
-### 결과 분석
+```text
+POST /coupons/1/issue?userId={userId}
+POST /coupons/1/issue/redis?userId={userId}
+```
 
-> ####  Race Condition으로 인한 초과 발급
-> DB에서 `조회 → 검증 → 발급`과정을 처리하는데, 
-> 여러 요청이 동시에 현재 발급 수량을 읽고 발급 가능으로 판단하여 **Race Condition(49건의 초과 발급 발생)** 이 발생한다.
+**VUs는 가상 사용자 수**이며, 초당 요청 수와는 다른 값이므로,
+위 설정만으로 1,000개의 요청이 정확히 같은 시각에 서버에 도착한다고 보장되지는 않음.
 
-> ####  동시성 환경에서의 성능 한계 
-> Lock을 사용하지 않았음에도 1,000개의 동시 요청으로 인한 
-> **DB Connection Pool 경합 및 I/O 병목**으로 TPS가 **243.19 req/s** 수준에 머물렀다.
+### 측정 결과
 
----
+| 지표 | MySQL No Lock | MySQL 비관적 락 | Redis + Kafka |
+| --- | ---: | ---: | ---: |
+| **총 요청 수** | 1,000 | 1,000 | 1,000 |
+| **HTTP 요청 처리량** | 243.19 req/s | 170.91 req/s | 441.66 req/s |
+| HTTP 200 | 549건 | 500건 | 500건 |
+| HTTP 400 | 451건 | 500건 | 500건 |
+| **p95 응답 시간** | 3.89초 | 5.61초 | 2.11초 |
+| **최대 응답 시간** | 3.97초 | 5.72초 | 2.12초 |
+| **기록된 최종 발급 건수** | 549건 | 500건 | 500건 |
+| **초과 여부** | 49건 초과 | 초과 없음 | 초과 없음 |
 
-### RDBMS(Pessimistic Lock) 테스트 결과
-<img width="732" height="415" alt="Image" src="https://github.com/user-attachments/assets/12a7a8c6-2646-416b-a4ec-2a0f1223a15e" />
+- 요청 처리량은 성공과 거절 응답을 포함한 HTTP 요청 처리량입니다.
+- p95는 측정된 요청의 95%가 해당 시간 이내에 완료되었다는 의미입니다.
+- Redis + Kafka의 최종 발급 건수는 HTTP 응답과 별도로 DB를 확인한 결과입니다.
 
-| 지표 (Metrics) | 측정 결과 수치 | 비고 및 상태 |
-| :--- | :--- | :--- |
-| **Total Requests** | 1,000 req | 총 요청 건수 |
-| **Throughput (TPS)** | **170.91 req/s** | 초당 처리량 |
-| **HTTP 200** | **50% (500건)** | 쿠폰 발급 성공 |
-| **HTTP 400** | **50% (500건)** | 쿠폰 발급 실패 |
-| **p(95) Latency** | **5.61s(5,610ms)** | 상위 5% 요청의 응답 시간 |
-| **Max Latency** | **5.72s (5,720ms)** | 최대 응답 시간 |
-| **데이터 정합성 (Integrity)** | **초과 발급 X** | 정합성 만족  |
+<details>
+<summary>원본 측정 화면</summary>
 
----
+#### MySQL No Lock
 
-### 결과 분석
+![No Lock 측정 결과](https://github.com/user-attachments/assets/61c43217-2a70-489b-8274-1a3e8a2fd989)
 
-> #### 비관적 락(Pessimistic Lock)을 통한 정합성 확보
-> 쿠폰 레코드에 비관적 락(Pessimistic Lock)을 적용하여 트랜잭션을 순차 처리함으로써 
-> **정확히 500건**만 발급하여 정합성 문제를 해결했다.
+#### MySQL 비관적 락
 
-> #### Lock Queueing으로 인한 응답 지연
-> 동시 요청이 Lock 획득을 위해 대기(Queueing)하면서 
-> **No Lock 대비 TPS는 29.7% 감소(170.91 req/s)했고, p(95) Latency는 44.2% 증가(5.61s)** 하는 병목이 발생했다.
+![비관적 락 측정 결과](https://github.com/user-attachments/assets/12a7a8c6-2646-416b-a4ec-2a0f1223a15e)
 
----
+#### Redis + Kafka
 
-### Redis 테스트 결과
-<img width="703" height="417" alt="Image" src="https://github.com/user-attachments/assets/46569dee-715c-41b8-819b-2f516ad7dab0" />
+![Redis Kafka 측정 결과](https://github.com/user-attachments/assets/46569dee-715c-41b8-819b-2f516ad7dab0)
 
-| 지표 (Metrics) | 측정 결과 수치 | 비고 및 상태 |
-| :--- | :--- | :--- |
-| **Total Requests** | 1,000 req | 총 요청 건수 |
-| **Throughput (TPS)** | **441.66 req/s** | 초당 처리량 |
-| **HTTP 200** | **50% (500건)** | 쿠폰 발급 성공 |
-| **HTTP 400** | **50% (500건)** | 쿠폰 발급 실패 |
-| **p(95) Latency** | **2.11s(2,110ms)** | 상위 5% 요청의 응답 시간 |
-| **Max Latency** | **2.12s (2,120ms)** | 최대 응답 시간 |
-| **데이터 정합성 (Integrity)** | **초과 발급 X** | 정합성 만족  |
----
+</details>
 
-### 결과 분석
+### 결과 해석
 
-> #### 초기 Redis RTT로 인한 정합성 문제
-> 싱글 스레드 기반 Redis를 도입했으나, `조회 → 검증 → 발급` 명령 간 **네트워크 RTT(Round Trip Time)**발생으로 인해 명령 사이에 다른 요청들이 침범하면서 Race Condition이 발생하여 정합성이 깨지는 현상이 발생했다. 이를 해결하기 위해 중복 검증과 `조회 → 검증 → 발급` 과정을  
-> **Lua Script로 묶어 원자적(Atomic) 연산으로** 처리하게 함으로써 In-Memory 단에서 데이터 정합성을 확보했다.
+#### No Lock: 초과 발급 재현
 
-> #### DB Synchronous Write 병목으로 인한 응답 지연
-> Redis를 활용해 In-Memory 단에서 원자적(Atomic) 연산을 처리하더라도, HTTP 요청 주기 내에서 DB에 동기(Synchronous) 방식으로 데이터를 저장하면  **RDBMS I/O 병목 및 Connection Pool 고갈**로 인해 전체 응답 지연이 발생하였다. 이를 해결하기 위해 **Kafka 메시지 큐**를 도입해 DB 쓰기 트랜잭션을 **비동기화**했 다. Redis 검증 직후 Kafka로 이벤트를 발행하고 클라이언트에게 즉시 응답(Early Return)하여 응답 시간을 최소화했다. 또한 **Kafka Consumer가 DB 저장을 HTTP 요청 처리 경로에서 밖에서 비동기로 처리하게 하여 DB I/O 병목을 격리**하고 메시지 내구성(Durability)을 확보했다.
+동시성 제어가 없는 방식에서는 여러 요청이 발급 가능한 상태를 확인한 뒤
+저장을 진행하면서 목표 수량 500장보다 **49건이 초과 발급**되었습니다.
 
-> #### TPS 및 Latency 개선
-> DB에 직접 조회/수정 대신 Redis In-Memory 연산 및 Kafka 메시지 발행만 수행하여 응답 시간을 최소화하여, 
-> Pessimistic Lock 대비 처리량은 **170.91 req/s → 441.66req/s로  약158.39% 증가**했으며, p(95) Latency는 **5.61s → 2.11s로 약 62.4%감소**했다.
+단순한 조회와 조건 검사만으로는 동시 요청에서 수량 제한을 지키기 어렵다는 점을 확인했습니다.
 
-## 최종 성능 비교 및 결론
-| 제어 방식 (Architecture) | TPS (초당 처리량) | p(95) Latency (응답 속도) | 데이터 정합성 (Integrity) |
-| :--- | :--- | :--- | :--- |
-| **RDBMS (No Lock)** | **243.19 req/s** | **3.89s(3,890ms)** | 실패(49건 초과발급) |
-| **RDBMS (Pessimistic Lock)** | **170.91 req/s -29.7%** | **5.61s(5,610ms) +44.2%** | 성공 |
-| **Redis + Kafka (In-Memory)** | **441.66 req/s +81.6%** | **2.11s(2,110ms) -45.8%** | 성공 |
+#### 비관적 락: 수량 제한과 응답 지연
 
-※ 모든 증감률은 No Lock 기준
-### No Lock 방식의 정합성 붕괴 및 Pessimistic Lock의 성능 한계
-동시성 제어가 없는 RDBMS(No Lock) 환경에서는 높은 TPS(243.19 req/s)를 기록했으나, Race Condition 발생으로 인해 500개 제한 대비 **49건이 초과 발급(실패)되며 데이터 정합성이 훼손**되었다. 이를 해결하기 위해 **비관적 락(Pessimistic Lock)**을 적용하여 500건 데이터 정합성을 확보했으나, **Lock Queueing으로 인해 No Lock 대비 TPS가 29.7% 감소(170.91 req/s)하고 p(95) 응답 시간은 44.2% 지연(5.61s)되는 성능 병목**을 확인했다.
+비관적 락 방식에서는 최종 발급 건수가 500건으로 기록되었습니다.
 
-### Redis + Kafka 도입을 통한 병목 분리 및 성능 개선
-Redis 싱글 스레드 특성과 Lua Script의 원자적(Atomic) 연산을 결합하여 500건 발급 제한을 초과하지 않고 정합성을 확보했다. 동시에 Kafka 비동기 파이프라인을 통해 HTTP 요청 주기의 DB I/O 부하를 HTTP 요청 처리 경로에서 분리함으로써, **No Lock 기준 대비 TPS는 81.6% 상승(441.66 req/s), p(95) 응답 시간은 45.8% 단축(2.11s)이라는 성능 개선**을 확인했다. (Pessimistic Lock 대비 TPS +158.4%, 응답 시간 -62.4%)
+반면 No Lock 대비 요청 처리량은 **약 29.7% 감소**하고,
+p95 응답 시간은 **약 44.2% 증가**했습니다.
 
-### 아키텍처 인사이트
-결과적으로 선착순 이벤트 시스템에서는 RDBMS Lock에 의존하는 방식보다, **Redis 싱글 스레드 기반의 In-Memory 동시성 제어와 Kafka 이벤트 드라이븐 비동기 처리(Eventual Consistency)를 결합한 아키텍처**가 본 테스트 환경과 요구사항에 가장 높은 처리량과 낮은 p(95)Latency를 보였다. 다만 DB 영속화를 비동기화하면서 Eventual Consistency라는 Trade Off와 **Redis/Kafka 장애에 대한 복구 전략**이 필요함을 확인했다.
+락을 획득한 요청이 처리되는 동안 다른 요청이 대기하는 구조와 함께
+응답 지연이 증가하는 결과를 관측했습니다.
 
----
+#### Redis + Kafka: HTTP 응답 경로의 DB 저장 분리
 
-## 장애 대응 및 트러블슈팅
+Redis + Kafka 방식에서는 비관적 락 대비
+HTTP 요청 처리량이 **약 2.58배로 증가**하고,
+p95 응답 시간은 **약 62.4% 감소**했습니다.
 
-### Redis 서버 장애 대응
+다만 두 방식은 HTTP 응답 전에 완료하는 작업이 다릅니다.
 
-**문제 상황**
-> Redis 장애 발생 시 쿠폰 발급 로직 중단
+- MySQL 방식은 DB 저장과 트랜잭션 완료 후 응답합니다.
+- 측정 당시 Redis + Kafka 방식은 Kafka 비동기 전송을 호출한 뒤,
+  발행 완료와 DB 저장을 기다리지 않고 응답합니다.
 
-**테스트**
-> Redis 프로세스 강제 종료
+따라서 이 수치는 HTTP 응답 지표의 비교이며,
+최종 DB 저장까지의 처리 성능이 같은 비율로 개선됐다는 의미는 아닙니다.
 
-**검증**
-> scenarios: 
-> - executor: 'constant-arrival-rate',
-> - rate:  500,
-> - timeUnit: '1s',
-> - duration: '30s',
-> - preAllocatedVUs: 100,
-> - maxVUs: 1000,
+## 장애 실험
 
-`0~10초 Redis 정상 → 10초 Redis stop → 20초 Redis start`
+부하테스트 환경
 
-### 결과
-<img width="404" height="197" alt="Image" src="https://github.com/user-attachments/assets/cd520926-0165-4895-8e98-7dcfa3a17b6e" />
+```javascript
+{
+  executor: 'constant-arrival-rate',
+  rate: 500,
+  timeUnit: '1s',
+  duration: '30s',
+  preAllocatedVUs: 100,
+  maxVUs: 1000
+}
+```
 
-<img width="353" height="179" alt="Image" src="https://github.com/user-attachments/assets/923fdd17-b686-4dd3-97f5-19c39a5fabdc" />
+`rate: 500`은 초당 500회 iteration 시작을 목표로 하는 설정입니다.
+실제 시작·완료된 요청 수는 dropped iterations와 결과 지표를 함께 확인해야 합니다.
 
-#### 장애 구간(10~20초) 예외 처리 및 Latency 영향
+### 1. Redis 중단
 
-> Redis stop 구간 동안 들어온 요청은 애플리케이션 예외 핸들링을 통해 503 Service Unavailable 응답을 반환하여 차단했다.
+실험 순서:
 
-> Redis Connection Timeout 대기 시간으로 인해 Max Latency 18.54s가 발생하였으며, Threads Blocking으로 인한 k6의 dropped_iterations(8,378건)가 관측되었다.
+```text
+정상 동작 → 10초 시점 Redis 중단 → 20초 시점 Redis 재시작
+```
 
-#### 데이터 정합성 확보
+기존 기록에서 확인한 결과:
 
-> 설정된 선착순 수량 500개에 대해 k6 지표상 200 OK 500건, DB 실제 저장 500건으로 초과 발급 및 유실 없이 완벽히 일치했다.
+| 항목 | 기록값 |
+| --- | ---: |
+| **최대 응답 시간** | 18.54초 |
+| **dropped iterations** | 8,378건 |
+| HTTP 200 | 500건 |
+| DB 저장 건수 | 500건 |
 
+Redis 중단 구간에서 **긴 응답 지연**과 **요청 발생 누락**이 관측되었습니다.
+Redis 연결 대기와 서버 자원 점유가 영향을 주었을 가능성이 있으며,
+정확한 원인을 구분하려면 연결·스레드·자원 지표를 함께 수집해야 합니다.
 
->  Redis 재부팅 후 메모리가 비어있는 상태였지만, Kafka Consumer 및 DB 단의 수량 검증 로직이 작동하여 목표 수량 500개가 채워진 이후 들어온 요청들을 전부 400 Bad Request로 차단했다. (거짓 성공 응답 0건) 
-> 또한 DB레벨에서 (coupon_id, user_id)로 unique 제약 조건을 설정하여 중복을 방지하였다.
+현재 일반 예외 처리 코드는 HTTP 500을 반환합니다.
 
-**결론**: Redis 장애 환경에서도 Kafka 메시지 큐의 영속성과 Consumer의 순차 검증을 통해 초과 발급 없이 정합성을 확보했다.
+<details>
+<summary>원본 측정 화면</summary>
 
-#### 추후 개선 과제 
-> Redis AOF(Append Only File) 영속화 적용
-> Redis 재부팅 시 장애 직전의 재고 상태를 복원하여, Kafka Consumer 및 DB 까지 불필요한 초과 발급 요청 메시지가 유입되는 현상 자체를 Redis에서 방어함.
+![Redis 장애 측정 1](https://github.com/user-attachments/assets/cd520926-0165-4895-8e98-7dcfa3a17b6e)
 
+![Redis 장애 측정 2](https://github.com/user-attachments/assets/923fdd17-b686-4dd3-97f5-19c39a5fabdc)
 
-> Redis Client Timeout 단축 (Fast-Fail 적용)
-> Redis 장애 단락 시 스레드가 최장 18초간 블로킹되는 병목을 방지하기 위해 Connection/Read Timeout을 200ms~500ms 수준으로 단축 설정.
----
+</details>
 
-### Kafka Consumer 장애 및 Lag 누적
+### 2. Kafka Consumer 중단
 
-**문제 상황**
-> Consumer 장애 발생 시 Kafka 메시지가 처리되지 못하고 DB 저장 지연
+실험 순서:
 
-**테스트**
-> Consumer 프로세스 중지 후 쿠폰 발급 요청
-> Consumer를 실행하여 누적된 메시지들 소모 확인
+```text
+Consumer 중단 → 발급 요청 → Lag 누적 → Consumer 재실행 → DB 반영 확인
+```
 
-**검증**
-> scenarios: 
-> - executor: 'constant-arrival-rate',
-> - rate:  500,
-> - timeUnit: '1s',
-> - duration: '30s',
-> - preAllocatedVUs: 100,
-> - maxVUs: 1000,
+기존 기록에서는 Consumer 중단 중 Partition별 Lag가 누적되고,
+재실행 이후 Lag가 0으로 감소하는 것을 확인했습니다.
 
-`Consumer Stop → 쿠폰 발급 요청 → Kafka Lag 누적 → Consumer Start → 메시지 재처리`
+| 비교 항목 | 기록값 |
+| --- | ---: |
+| **Redis에서 처리한 발급 수량** | 263건 |
+| **Consumer 복구 후 DB 저장 건수** | 263건 |
 
-**결과**
+해당 실험에서는 Redis 처리 수량과 복구 후 DB 저장 건수가 일치했습니다.
 
-※ k6 테스트 결과
-<br>
-<img width="361" height="183" alt="Image" src="https://github.com/user-attachments/assets/72d460fa-3fef-4baf-aa42-a63f6fd2a032" />
+이는 Kafka에 전달된 메시지가 Consumer 중단 동안 대기하고
+복구 이후 처리되는 흐름을 확인한 결과입니다.
 
-※ Lag 누적과 DB 미저장 상태 확인
-<br>
-<img width="624" height="142" alt="Image" src="https://github.com/user-attachments/assets/eff120a6-9854-4849-8d89-bebbf706dbed" />
+<details>
+<summary>원본 측정 화면</summary>
 
-<img width="570" height="381" alt="Image" src="https://github.com/user-attachments/assets/f28708cd-a858-404b-afd7-4bb6f2b5e643" />
+![Consumer 중단 시 Lag](https://github.com/user-attachments/assets/eff120a6-9854-4849-8d89-bebbf706dbed)
 
-※ Lag 소모와 DB 재처리 확인
-<br>
-<img width="633" height="151" alt="Image" src="https://github.com/user-attachments/assets/700a0500-74be-4269-a715-c75c08bdaf79" />
+![Consumer 복구 후 Lag](https://github.com/user-attachments/assets/700a0500-74be-4269-a715-c75c08bdaf79)
 
-<img width="545" height="392" alt="Image" src="https://github.com/user-attachments/assets/96d1b858-2ec4-4011-80af-7e74243ac505" />
+![DB 반영 확인](https://github.com/user-attachments/assets/96d1b858-2ec4-4011-80af-7e74243ac505)
 
-<img width="248" height="39" alt="Image" src="https://github.com/user-attachments/assets/e0b288a1-9fbe-4124-aad9-d77a70754d8c" />
+</details>
 
+### 3. MySQL 중단
 
-#### Consumer 장애 구간 메시지 적재
+실험 순서:
 
-> 테스트 시작 전 Kafka Consumer를 중지한 상태에서 500 req/s의  발급 요청을 발생시켰다.
-> Consumer 중지 상태에서도 Redis는 쿠폰 발급을 정상 처리했으며, Producer 역시 발급 이벤트를 Kafka 토픽으로 정상 발행했다.
-> 이 과정에서 Consumer가 중지되어 있어 Kafka 메시지를 DB로 전달하지 못하면서 각 Partition에 처리되지 않은 메시지가 Lag형태로 누적되는 것을 확인했다.
+```text
+MySQL 중단 → 발급 요청 및 저장 지연 → MySQL 복구 → Lag와 DB 확인
+```
 
-#### Kafka Lag 누적 관측
+기존 기록에서는 DB 저장이 지연되는 동안 Lag가 누적되고,
+MySQL 복구 이후 DB 반영과 Lag 감소를 확인했습니다.
 
-> Consumer 장애 상태 동안 Partition별 Lag를 확인한 결과, Kafka에 처리되지 않은 메시지가 누적되는 것을 확인했다.
+| 비교 항목 | 기록값 |
+| --- | ---: |
+| 초기 쿠폰 수량 | 500개 |
+| Redis 잔여 재고 | 245개 |
+| 복구 후 DB 저장 건수 | 255건 |
+| 최종 Consumer Lag | 0 |
 
-#### Consumer 복구 및 메시지 재처리
+잔여 재고 245개와 DB 저장 255건의 합이 초기 수량 500개와 일치했습니다.
 
-> 부하 테스트 종료 후 Kafka Consumer를 재실행했다.
-> Consumer가 재가동되면서 Kafka에 누적되어 있던 메시지를 순차적으로 소비하였으며, Lag가 0이 된 것을 확인했다.
-> Consumer 장애 중 적재된 메시지가 유실되지 않고 정상적으로 재처리되었음을 확인했다.
+이를 통해 해당 실험에서 지연된 발급 정보가
+복구 이후 DB에 반영되는 흐름을 확인했습니다.
 
-#### 데이터 정합성 확보
+<details>
+<summary>원본 측정 화면</summary>
 
-> Redis에서 최종적으로 차감된 쿠폰 수량과 Consumer 복구 후 MySQL에 저장된 쿠폰 발급 데이터의 수량을 비교하였다.
-> Redis 발급 수량 [263건], MySQL 저장 수량 [263건]으로 일치하여 Consumer 장애 및 복구 과정에서 쿠폰 발급 데이터의 유실이 발생하지 않았음을 확인했다.
+![MySQL 장애 시 Lag](https://github.com/user-attachments/assets/27e43041-c2c6-4e06-969d-bfb110a970f0)
 
-**결론**: Kafka Consumer 장애 상황에서도 발급 이벤트가 Kafka에 보존되어 메시지 유실 없이 누적되었으며, Consumer 복구 후 미처리 메시지가 정상적으로 재처리되어 Kafka Lag이 0으로 감소하고 최종적으로 MySQL에 데이터가 정상 반영됨을 확인하였다.
+![MySQL 복구 후 Lag](https://github.com/user-attachments/assets/f5026b6c-747a-4f8a-92f4-08a7888cc060)
 
-#### 추후 개선 과제
+![DB 수량 확인](https://github.com/user-attachments/assets/1f6c167a-4974-4615-8438-b99854551752)
 
-> Kafka Consumer 장애 발생 시 Lag 증가량을 모니터링하고 임계치 초과 시 관리자에게 알림을 제공하도록 Consumer Lag 모니터링 및 Alert 시스템 구축
+</details>
 
----
+## VU 증가에 따른 부하 실험
 
-### MySQL 서버 장애 및 Eventual Consistency
+### 조건
 
-**문제 상황**
-> MySQL 장애로 인해 DB 저장 실패
+```javascript
+{
+  executor: 'per-vu-iterations',
+  iterations: 1,
+  vus: 10000,
+  maxDuration: '60s'
+}
+```
 
-**테스트**
-> MySQL 프로세스 중지 후 쿠폰 발급 요청
-> MySQL을 실행하고 테이블 확인 및 Redis와 정합성 체크
+VUs를 500, 1,000, 2,000, 5,000, 10,000으로 변경하며 실행했습니다.
+각 VU는 한 번씩 요청하므로 지속적인 초당 요청률을 지정한 실험은 아닙니다.
 
-**검증**
-> scenarios: 
-> - executor: 'constant-arrival-rate',
-> - rate:  500,
-> - timeUnit: '1s',
-> - duration: '30s',
-> - preAllocatedVUs: 100,
-> - maxVUs: 1000,
+### 기존 측정 결과
 
-`MySQL Stop → 쿠폰 발급 요청 → MySQL Start → DB 저장 확인`
+| VUs | HTTP 요청 처리량 | p95 응답 시간 | HTTP 200 | 연결 실패 |
+| --- | ---: | ---: | ---: | ---: |
+| 500 | 257 req/s | 1.90초 | 500건 | 0건 |
+| 1,000 | 424 req/s | 2.23초 | 500건 | 0건 |
+| 2,000 | 721 req/s | 2.45초 | 500건 | 0건 |
+| 5,000 | 1,024 req/s | 3.86초 | 500건 | 836건 |
+| 10,000 | 1,918 req/s | 3.54초 | 500건 | 3,711건 |
 
-**결과**
-※ k6 테스트 결과
-<br>
-<img width="360" height="189" alt="Image" src="https://github.com/user-attachments/assets/f0ebe565-3da6-4c58-8c34-7e6eff608fb8" />
+5,000 VU 이상에서 다음 연결 오류가 관측되었습니다.
 
-※ Lag 누적과 소모 확인
-<br>
-<img width="625" height="148" alt="Image" src="https://github.com/user-attachments/assets/27e43041-c2c6-4e06-969d-bfb110a970f0" />
+```text
+dial tcp 127.0.0.1:8080: connectex:
+No connection could be made because the target machine actively refused it.
+```
 
-<img width="620" height="139" alt="Image" src="https://github.com/user-attachments/assets/f5026b6c-747a-4f8a-92f4-08a7888cc060" />
 
-※ 정합성 확인
-<br>
-<img width="139" height="51" alt="Image" src="https://github.com/user-attachments/assets/77e189b2-d210-4555-a70d-0beba5d80aa5" />
+## 한계와 개선 방향
 
-<img width="253" height="35" alt="Image" src="https://github.com/user-attachments/assets/1f6c167a-4974-4615-8438-b99854551752" />
+### Redis 변경과 Kafka 발행 사이의 실패 구간
 
+Redis에서 재고 차감과 사용자 등록을 마친 후
+Kafka 발행에 실패하면 DB에 발급 정보가 남지 않을 수 있습니다.
 
-#### MySQL 장애 구간의 DB 저장 실패
+기존 Producer는 비동기 전송 결과를 로그로 처리하며,
+실패 결과가 이미 반환한 HTTP 응답에 반영되지는 않습니다.
 
-> 서버가 정상적으로 동작하는 상태에서 MySQL만 중지한 상태에서의 DB 장애 상황을 재현했다.
-> MySQL 장애 상태에서도 Redis 재고 차감과 Kafka Producer의 이벤트 발행은 정상적으로 수행되었다. 반면 Consumer는 DB와 연결 실패로 인한 재시도가 발생하면서 메시지가 소비되지 못하고 Partition에 Lag 형태로 누적되었다.
+발행 결과 확인과 함께,
+실패 상태를 보관하고 재처리·대조하는 복구 경로를 검토할 필요가 있습니다.
 
-#### MySQL 복구 후 메시지 재처리
+### 중복 소비와 재시도
 
-> MySQL 복구 이후 Kafka Consumer가 정상적으로 DB 저장을 재개하면서 장애 기간 동안 누적되었던 Kafka Lag를 소모했다.
-> 최종적으로 모든 Partition의 Lag가 0으로 감소하여, MySQL 장애 동안 처리되지 못했던 메시지가 복구 이후 정상적으로 처리되었음을 확인했다.
+DB unique 제약은 중복 행의 저장을 제한하지만,
+중복 이벤트를 정상적으로 처리 완료하는 정책을 대신하지 않습니다.
 
-#### 데이터 정합성 확보
+중복 메시지, 일시적 DB 장애, 반복 실패 메시지를 구분하고
+재시도 및 최종 실패 처리 정책을 정리할 계획입니다.
 
-> Redis의 최종 재고와 MySQL의 실제 발급 데이터를 비교하여 장애 복구 이후 데이터 정합성을 검증하였다.
-> 총 500개 수량 중 Redis 잔여 재고 [245개], MySQL 실제 저장 데이터 [255건]으로, 합산 500건이 정확히 일치함을 확인했다.
-> 최종적으로 Kafka Lag 또한 0에 도달하여 `Redis 처리 → Kafka  이벤트 누 → MySQL 저장` 과정에서의 데이터 정합성을 확인했다.
+### 발급 경로 간 재고 기준
 
-**결론**: MySQL 장애 상황에서도 Redis를 통한 쿠폰 발급 및 Kafka Lag 적재는 정상적으로 수행되었으며, DB 저장이 지연되더라도 Kafka에 메시지가 보존되었다. 이후 MySQL 복구 시 Consumer가 미처리 메시지를 재처리하여 Kafka Lag가 0으로 감소하고 최종적으로 MySQL에 모든 발급 데이터가 반영되는 Eventual Consistency 구조를 검증했다.
+MySQL 경로와 Redis 경로는 발급 가능 수량을 판단하는 기준이 다릅니다.
 
-#### 추후 개선 과제
+현재 비교 실험은 상태를 초기화한 뒤 각 방식을 따로 실행한 결과입니다.
+같은 쿠폰을 두 API에서 동시에 발급할 때의 수량 일관성은 별도 검증이 필요합니다.
 
-> Dead Letter Queue(DLQ) 도입
-> 반복적인 DB 저장 실패가 발생하는 메시지를 별도의 DLQ로 분리하여 일반 메시지 처리 지연을 방지하고 장애 원인을 추적할 수 있도록 개선한다.
 
-> Kafka Consumer Lag 모니터링
-> Consumer 장애 및 MySQL 장애로 인한 Lag 증가를 실시간으로 모니터링하고, 일정 임계치를 초과할 경우 관리자에게 알림을 제공하도록 개선한다.
+## 실행 안내
 
----
+### 사전 준비
 
-## Redis 점진적 부하 한계 테스트
+- Java 17
+- MySQL 및 `coupon_db`
+- Redis 호환 서버
+- Kafka 및 `coupon-issue` 토픽
+- k6
 
-### 테스트 조건
-> scenarios: 
-> - executor: 'per-vu-iterations'
-> - iterations: 1
-> - vus: `500 → 1,000 → 2,000 → 5,000 → 10,000`
-> - maxDuration: '60s'
+DB 계정과 비밀번호, Redis 및 Kafka 접속 정보를
+`application.properties`에서 실행 환경에 맞게 설정합니다.
 
-### 결과
+**실제 비밀번호가 포함된 설정은 공개 저장소에 올리지 않습니다.**
 
-**- Target VU : 500** 
-<br>
-<img width="692" height="261" alt="Image" src="https://github.com/user-attachments/assets/81fa3082-0708-4f8b-9101-86c74cb349b0" />
+### API 서버
 
-**- Target VU : 1000**
-<br>
-<img width="698" height="278" alt="Image" src="https://github.com/user-attachments/assets/e2b1c681-3a29-4f36-9081-9ad75df8d004" />
+```powershell
+.\gradlew.bat bootRun
+```
 
-**- Target VU : 2000**
-<br>
-<img width="699" height="281" alt="Image" src="https://github.com/user-attachments/assets/a9211971-c68a-434e-b815-254b57da7eb0" />
+### 테스트 데이터 초기화
 
-**- Target VU : 5000**
-<br>
-<img width="720" height="279" alt="Image" src="https://github.com/user-attachments/assets/3f290831-c2a5-4dce-9519-bba11f063dc4" />
+초기화 기능을 사용하는 경우 다음 옵션으로 실행합니다.
 
-**- Target VU : 10000**
-<br>
-<img width="721" height="280" alt="Image" src="https://github.com/user-attachments/assets/0f3e19d9-07c3-4521-bf15-e8524cfad92f" />
+```powershell
+.\gradlew.bat bootRun --args="--app.initialize-data=true"
+```
 
-### 테스트 결과 요약
+> 초기화는 기존 발급 내역을 삭제하고 Redis 재고·사용자 정보를 재설정합니다.
+> 요청 발생을 멈추고 이전 Kafka 메시지의 처리 상태를 확인한 뒤 실행해야 합니다.
+> 재시작·장애 복구 실험에서는 초기화 옵션을 사용하지 않습니다.
 
-| Target VU | 실제 TPS | p(95) Latency | HTTP 200 / 정합성 | 연결실패 | 
-| :--- | :--- | :--- | :--- | :--- | 
-| **500req/s** | **257req/s** | **1.90s** | **500건(만족)** | **0건** | 
-| **1000req/s** | **424req/s** | **2.23s** | **500건(만족)** | **0건** | 
-| **2000req/s** | **721req/s** | **2.45s** | **500건(만족)** | **0건** |
-| **5000req/s** | **1024req/s** | **3.86s** | **500건(만족)** | **836건** | 
-| **10000req/s** | **1918req/s** | **3.54s** | **500건(만족)** | **3711건** | 
+### Consumer
 
-### 분석
+IDE에서 다음 클래스를 별도 실행합니다.
 
-#### 부하 증가에 따른 처리량 변화
+```text
+com.example.kafka.KafkaConsumerApplication
+```
 
-> 500 VU에서 **257 TPS**를 처리했으며, 부하를 1,000 → 2,000 → 5,000 → 10,000 VU로 증가시키자 처리량은 각각 **424 → 721 → 1,024 → 1,918 TPS**까지 증가했다.
-> 다만 VU 증가폭에 비해 실제 처리량 증가폭은 점차 감소했다. 이는 부하가 증가하면서 서버의 스레드 및 네트워크 연결 처리 능력이 병목으로 작용하기 시작했음을 의미한다.
+API 서버와 Consumer는 별도 프로세스로 실행합니다.
 
-#### 5,000 VU 이상 구간 연결 실패 발생
+### 부하 테스트
 
-> 5,000 VU부터 `connection refused` 에러가 발생(836건)하고, 10,000 VU에서는 3,711건으로 급증했.
-> 실제 로그에서도 다음과 같은 오류코드가 확인되었는데,
-> `dial tcp 127.0.0.1:8080: connectex: No connection could be made because the target machine actively refused it.`
-> 해당 에러는 연산 실패가 아닌, **Tomcat/OS 레벨의 연결 수용 한계에 도달하면서 8080 포트에 대한 connection refused가 발생한 것**으로 판단된다.
+```powershell
+k6 run k6-test.js
+```
 
-*10,000 VU의 p(95) 응답시간(3.54s)이 5,000 VU(3.86s)보다 짧게 측정된 원인은, 다수의 요청이 connection refused로 즉시 실패하여 실제 서버 처리 요청의 latency만 집계된 결과다.
-
-#### 높은 부하 환경 속 데이터 정합성 보장
-
-> 연결 거부 에러가 대량 발생한 10,000 VUs 테스트 환경에서도, **중복/초과 발급 없이 정확히 500건의 쿠폰만 성공 처리**하여 데이터 정합성을 확보함.
+실행 전에 대상 API, VUs, iteration 수,
+사용자 ID와 초기 재고를 확인해야 합니다.
